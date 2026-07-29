@@ -1,0 +1,27 @@
+name: Optional Model Integration
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * 1-5"
+
+permissions:
+  contents: read
+
+jobs:
+  openai-compatible-smoke:
+    runs-on: ubuntu-latest
+    env:
+      OPENAI_API_KEY: ${{ secrets.PROMPTOS_INTEGRATION_API_KEY }}
+      OPENAI_BASE_URL: ${{ secrets.PROMPTOS_INTEGRATION_BASE_URL }}
+      PROMPTOS_INTEGRATION_MODEL: ${{ vars.PROMPTOS_INTEGRATION_MODEL }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install --upgrade pip && python -m pip install ".[dev]"
+      - name: Require explicitly configured integration credentials
+        run: test -n "$OPENAI_API_KEY" && test -n "$OPENAI_BASE_URL" && test -n "$PROMPTOS_INTEGRATION_MODEL"
+      - name: Run one real OpenAI-compatible request
+        run: python -m unittest tests/test_openai_integration.py -v

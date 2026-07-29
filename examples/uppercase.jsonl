@@ -1,0 +1,3 @@
+{"id": "u1", "text": "hello", "expected": "HELLO"}
+{"id": "u2", "text": "PromptOS", "expected": "PROMPTOS"}
+{"id": "u3", "text": "mixed Case 42", "expected": "MIXED CASE 42"}
