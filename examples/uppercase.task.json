@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "task": {
+    "name": "uppercase-transform",
+    "input_fields": ["text"],
+    "output_description": "Convert text to uppercase and return only the converted text.",
+    "output_schema": {"type": "string"}
+  },
+  "dataset": {
+    "path": "uppercase.jsonl",
+    "expected_field": "expected"
+  },
+  "signals": {
+    "path": "../artifacts/signals.json"
+  },
+  "models": {},
+  "optimization": {
+    "initial_prompt": "处理输入",
+    "rounds": 3,
+    "max_calls": 100,
+    "max_cost_usd": 10.0,
+    "max_seconds": 900
+  },
+  "runs_dir": "../artifacts/runs"
+}
