@@ -64,6 +64,24 @@ class PromptOSTests(unittest.TestCase):
         )
         self.assertEqual(candidates, ["candidate one", "candidate two"])
 
+    def test_llm_prompt_generator_falls_back_to_auditable_candidates(self):
+        class EchoModel:
+            def _chat(self, system, user):
+                return ModelResponse(
+                    '```json\n[{"current_prompt":"initial"}]\n```',
+                    "fake",
+                )
+
+        candidates = list(
+            LLMPromptGenerator(EchoModel()).propose(
+                "initial", self.task, self.signals, "improve boundaries",
+            )
+        )
+        distinct = [value for value in candidates if value != "initial"]
+        self.assertEqual(len(distinct), 2)
+        self.assertIn("路由冲突", distinct[0])
+        self.assertIn("歧义与输出自检", distinct[1])
+
     def test_run_store_records_provenance_without_secrets(self):
         optimizer = PromptOptimizer(RuleBasedDemoModel(), SignalEvaluator(ReferenceJudge()), TemplatePromptGenerator())
         result = optimizer.optimize("uppercase", self.task, self.signals, self.samples, Budget(max_calls=5), rounds=0)

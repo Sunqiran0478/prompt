@@ -209,7 +209,41 @@ class LLMPromptGenerator(PromptGenerator):
                         values.append(item["current_prompt"])
         else:
             values = []
-        return [str(item) for item in values]
+        candidates = [str(item) for item in values]
+        normalized = {
+            "\n".join(line.rstrip() for line in value.replace("\r\n", "\n").splitlines()).strip()
+            for value in candidates
+        }
+        current = "\n".join(
+            line.rstrip() for line in prompt.replace("\r\n", "\n").splitlines()
+        ).strip()
+        fallbacks = [
+            (
+                f"{prompt.rstrip()}\n\n"
+                "# 内部路由冲突检查（只执行，不输出检查过程）\n"
+                "先识别用户最终要完成的动作，再按显式路由规则的优先级消解冲突；"
+                "直接买卖/持仓操作意图优先于一般分析，代码、筛选、测算等任务执行意图"
+                "优先于知识解释。选择 L3 后必须反查其 L2 父级，禁止跨父级组合。"
+            ),
+            (
+                f"{prompt.rstrip()}\n\n"
+                "# 内部歧义与输出自检（只执行，不输出检查过程）\n"
+                "信息不足或存在多个同等合理意图时，采用保守分类并降低 confidence；"
+                "不要用高置信度掩盖歧义。输出前检查 JSON 可解析、必需字段齐全、"
+                "L2/L3 名称与 ID 一致、父子关系合法、dim_tag 规则正确、"
+                "confidence 位于 0 到 1、reason 不超过 50 字，且不得输出额外文本。"
+            ),
+        ]
+        for fallback in fallbacks:
+            key = "\n".join(
+                line.rstrip() for line in fallback.replace("\r\n", "\n").splitlines()
+            ).strip()
+            if key != current and key not in normalized:
+                candidates.append(fallback)
+                normalized.add(key)
+            if len(normalized - {current}) >= 2:
+                break
+        return candidates
 
 
 class ReferenceJudge:
