@@ -34,9 +34,48 @@ promptos optimize \
   --signals artifacts/signals.json --prompt "处理输入" --runs artifacts/runs
 ```
 
+`optimize` 是兼容模式，会对全量样本调用 Judge。真实实验推荐使用下面的
+`optimize-layered` 分层模式。
+
 该示例使用本地演示模型。SDK 中也提供 `OpenAICompatibleModel` 与 `LLMJudge`：它们读取运行时环境变量 `OPENAI_API_KEY` 和可选的 `OPENAI_BASE_URL`，不把密钥写入任何文件。
 
 可设置 `PROMPTOS_CACHE_DIR=/local/cache/path` 启用无密钥响应缓存。缓存键包含端点与完整请求体，不包含认证头；网络调用会对 429、5xx 和临时网络错误做指数退避重试。
+
+## 推荐：分层风险优化
+
+分层模式先让任务模型处理所有样本并执行不调用 LLM 的确定性检查，再把固定
+`boundary_probe` 与动态风险 Top-K 合并为统一 Judge 集合。所有 Prompt 候选都在
+同一集合上比较；格式、Schema 或 taxonomy 硬失败不会浪费 Judge 调用。
+
+```bash
+promptos optimize-layered \
+  --dataset samples.jsonl --inputs query \
+  --signals artifacts/signals.json \
+  --plugin finance_classification --taxonomy /absolute/path/taxonomy.json \
+  --model deepseek-chat --judge-model deepseek-reasoner \
+  --max-candidates 2 --dynamic-top-k 30 \
+  --judge-max-cases-per-prompt 80 --human-review-top-k 20 \
+  --runs artifacts/runs
+```
+
+金融数据每行的 `metadata.sample_kind` 为 `boundary_probe` 时固定进入 Judge，
+`metadata.boundary_note` 会连同风险原因、业务 metadata 和各 Prompt 的对比输出传给
+Judge。默认策略是最多 2 个候选、动态 Top 30、每个 Prompt 最多 Judge 80 条、人工
+Review 最多 20 条。若固定边界样本已经超过 80，程序会在任何模型调用前拒绝运行。
+
+每个阶段会立即保存，指定同一 run ID 可以断点恢复：
+
+```bash
+promptos optimize-layered ... --resume-run layered_abc123
+```
+
+运行目录包含 `task_outputs.jsonl`、`deterministic_checks.jsonl`、
+`risk_scores.jsonl`、`judge_queue.json`、`judge_results.jsonl`、
+`prompt_comparison.json`、`human_review_top20.csv` 和 `run.json`。
+`risk_scores.jsonl` 保留每条风险信号的来源与解释。冠军严格按“硬失败更少 →
+边界 Judge 更好 → 动态风险 Judge 更好 → 稳定性更高 → Prompt/Token 更少”的
+字典序产生，不使用隐藏加权分数。无金标实验仍标记为
+`provisional_silver_or_unlabeled`。
 
 ## 无标注数据与人工审核
 
@@ -142,6 +181,28 @@ PYTHONPATH=src python3 -m promptos.cli run-config --config examples/uppercase.ta
 ```
 
 路径均相对 `task.json` 本身解析。`run-config --prompt "…"` 或 `--model MODEL` 仅覆盖本次运行；其他配置保持冻结。真实网关地址可放在 `models.base_url`，鉴权仍只使用环境变量。
+
+金融分层任务的核心配置如下；`taxonomy_path` 同样相对配置文件解析：
+
+```json
+{
+  "plugin": {
+    "name": "finance_classification",
+    "taxonomy_path": "./taxonomy.json"
+  },
+  "evaluation": {
+    "mode": "layered",
+    "max_candidates": 2,
+    "fixed_sample_kinds": ["boundary_probe"],
+    "dynamic_top_k": 30,
+    "judge_max_cases_per_prompt": 80,
+    "human_review_top_k": 20
+  }
+}
+```
+
+配置为 `evaluation.mode: "layered"` 时，`run-config` 自动路由到分层优化；
+`legacy` 或省略该字段时继续使用旧流程。
 
 ## 开发
 

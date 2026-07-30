@@ -84,13 +84,20 @@ class LLMJudge:
     def __init__(self, model: OpenAICompatibleModel):
         self.model = model
 
-    def score(self, signal_spec: SignalSpec, sample: Sample, output: str) -> Judgment:
+    def score(
+        self,
+        signal_spec: SignalSpec,
+        sample: Sample,
+        output: str,
+        context: dict[str, Any] | None = None,
+    ) -> Judgment:
         rubric = {"hard_constraints": [asdict(item) for item in signal_spec.hard_constraints],
                   "soft_signals": [asdict(item) for item in signal_spec.soft_signals]}
         payload = self.model.complete_json(
             "You are a strict evaluation judge. Do not improve the answer. Return JSON only.",
             json.dumps({"acceptance_criteria": signal_spec.acceptance_criteria, "rubric": rubric,
                         "inputs": sample.inputs, "reference": sample.expected, "candidate_output": output,
+                        "evaluation_context": context or {},
                         "required_output": {"hard_failures": ["constraint name"], "signal_scores": {"signal name": 0.0},
                                             "score": 0.0, "confidence": 0.0, "rationale": "brief reason"}}, ensure_ascii=False))
         allowed = {signal.name for signal in signal_spec.soft_signals}
@@ -132,12 +139,16 @@ class LLMSignalCompiler:
                        SoftSignal("output_clarity", "Is the output clear, specific, and useful?", 0.3)]
             return SignalSpec(spec_id, version, acceptance_criteria, [], signals, "draft", "local_template")
         payload = self.model.complete_json(
-            "Convert product acceptance criteria into an auditable evaluation rubric. Return JSON only.",
+            "Convert product acceptance criteria into an auditable evaluation rubric. Return JSON only. "
+            "Every soft-signal weight must be positive, and all weights should sum to 1.0.",
             json.dumps({"acceptance_criteria": acceptance_criteria,
                         "required_output": {"hard_constraints": [{"name": "", "description": ""}],
-                                            "soft_signals": [{"name": "", "criterion": "", "weight": 0.0}]}}))
+                                            "soft_signals": [{"name": "", "criterion": "", "weight": 1.0}]}}))
         hard = [item for item in payload.get("hard_constraints", []) if item.get("name")]
         soft = [item for item in payload.get("soft_signals", []) if item.get("name")]
+        if soft and sum(max(0.0, float(item.get("weight", 0.0))) for item in soft) <= 0:
+            equal_weight = 1.0 / len(soft)
+            soft = [{**item, "weight": equal_weight} for item in soft]
         return SignalSpec(spec_id, version, acceptance_criteria,
             [HardConstraint(**item) for item in hard],
             [SoftSignal(str(item["name"]), str(item["criterion"]), float(item["weight"])) for item in soft],
@@ -167,7 +178,14 @@ class LLMPromptGenerator(PromptGenerator):
 
 class ReferenceJudge:
     """Offline judge for examples/tests. Exact expected-output match earns one."""
-    def score(self, signal_spec: SignalSpec, sample: Sample, output: str) -> Judgment:
+    def score(
+        self,
+        signal_spec: SignalSpec,
+        sample: Sample,
+        output: str,
+        context: dict[str, Any] | None = None,
+    ) -> Judgment:
+        del context
         correct = sample.expected is not None and str(sample.expected).strip() == output.strip()
         scores = {signal.name: float(correct) for signal in signal_spec.soft_signals}
         return Judgment(float(correct), scores, [] if correct else ["reference_mismatch"], "Exact reference comparison.", 1.0)

@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from promptos.adapters import ReferenceJudge, RuleBasedDemoModel, TemplatePromptGenerator
+from promptos.adapters import LLMSignalCompiler, ReferenceJudge, RuleBasedDemoModel, TemplatePromptGenerator
 from promptos.core import Budget, PromptOptimizer, RunStore, Sample, SignalEvaluator, SignalSpec, SoftSignal, TaskSpec
 from promptos.provenance import Annotation, apply_annotations, export_review_csv, import_review_csv, select_review_cases
 from promptos.datasets import split_gold_samples, write_split
@@ -30,6 +30,23 @@ class PromptOSTests(unittest.TestCase):
         optimizer = PromptOptimizer(RuleBasedDemoModel(), SignalEvaluator(ReferenceJudge()), TemplatePromptGenerator())
         with self.assertRaisesRegex(ValueError, "approved"):
             optimizer.optimize("prompt", self.task, draft, self.samples, Budget(), rounds=0)
+
+    def test_llm_signal_compiler_recovers_from_all_zero_weights(self):
+        class ZeroWeightModel:
+            model = "test-model"
+
+            def complete_json(self, system, user):
+                return {
+                    "hard_constraints": [],
+                    "soft_signals": [
+                        {"name": "correctness", "criterion": "Correct result", "weight": 0},
+                        {"name": "clarity", "criterion": "Clear result", "weight": 0},
+                    ],
+                }
+
+        spec = LLMSignalCompiler(ZeroWeightModel()).compile("Return the correct result.")
+        self.assertEqual([signal.weight for signal in spec.soft_signals], [0.5, 0.5])
+        spec.validate()
 
     def test_run_store_records_provenance_without_secrets(self):
         optimizer = PromptOptimizer(RuleBasedDemoModel(), SignalEvaluator(ReferenceJudge()), TemplatePromptGenerator())
@@ -75,6 +92,37 @@ class PromptOSTests(unittest.TestCase):
             config_path.write_text(config_path.read_text().replace('"task_model": "example"', '"api_key": "forbidden"'))
             with self.assertRaisesRegex(ValueError, "credentials"):
                 load_task_config(config_path)
+
+    def test_layered_finance_config_resolves_plugin_and_policy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "task.json"
+            config_path.write_text(json.dumps({
+                "version": 1,
+                "task": {
+                    "name": "finance",
+                    "input_fields": ["query"],
+                    "output_description": "Classify.",
+                },
+                "dataset": {"path": "sample.jsonl"},
+                "signals": {"path": "signals.json"},
+                "models": {"task_model": "deepseek-chat"},
+                "plugin": {
+                    "name": "finance_classification",
+                    "taxonomy_path": "taxonomy.json",
+                },
+                "evaluation": {
+                    "mode": "layered",
+                    "fixed_sample_kinds": ["boundary_probe"],
+                    "dynamic_top_k": 30,
+                    "judge_max_cases_per_prompt": 80,
+                },
+            }))
+            config = load_task_config(config_path)
+            self.assertEqual(config.evaluation.mode, "layered")
+            self.assertEqual(config.evaluation.dynamic_top_k, 30)
+            self.assertEqual(config.plugin.taxonomy_path, root / "taxonomy.json")
+            self.assertEqual(config.optimization.initial_prompt, "")
 
     def test_human_review_csv_only_promotes_explicit_human_decisions(self):
         samples = [Sample("one", {"answer": "claim"})]
