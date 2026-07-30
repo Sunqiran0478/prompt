@@ -50,6 +50,10 @@ class EvaluationConfig:
     task_model_max_calls: int = 2000
     judge_model_max_calls: int = 240
     max_seconds: float = 7200.0
+    max_rounds: int = 5
+    stop_after_no_improvement: int = 2
+    minimum_improvement: float = 0.01
+    retain_risk_memory: bool = True
 
 
 @dataclass(frozen=True)
@@ -98,7 +102,8 @@ def load_task_config(path: Path) -> TaskConfig:
     evaluation_mode = str(evaluation.get("mode", "legacy"))
     initial_prompt_path = _resolve(root, optimization.get("initial_prompt_path"))
     if not optimization.get("initial_prompt") and initial_prompt_path is None and not (
-        plugin.get("name") == "finance_classification" and evaluation_mode == "layered"
+        plugin.get("name") == "finance_classification"
+        and evaluation_mode in {"layered", "layered_auto"}
     ):
         missing.append("optimization.initial_prompt or optimization.initial_prompt_path")
     if missing:
@@ -110,8 +115,8 @@ def load_task_config(path: Path) -> TaskConfig:
     if any("key" in key.lower() or "token" in key.lower() or "secret" in key.lower() for key in models):
         raise ValueError("Do not store credentials in task config; use environment variables.")
     mode = evaluation_mode
-    if mode not in {"legacy", "layered"}:
-        raise ValueError("evaluation.mode must be legacy or layered.")
+    if mode not in {"legacy", "layered", "layered_auto"}:
+        raise ValueError("evaluation.mode must be legacy, layered, or layered_auto.")
     fixed_sample_kinds = evaluation.get("fixed_sample_kinds", ["boundary_probe"])
     if not isinstance(fixed_sample_kinds, list) or not all(isinstance(item, str) and item for item in fixed_sample_kinds):
         raise ValueError("evaluation.fixed_sample_kinds must be a list of non-empty strings.")
@@ -129,6 +134,10 @@ def load_task_config(path: Path) -> TaskConfig:
         int(evaluation.get("task_model_max_calls", 2000)),
         int(evaluation.get("judge_model_max_calls", 240)),
         float(evaluation.get("max_seconds", 7200.0)),
+        int(evaluation.get("max_rounds", 5)),
+        int(evaluation.get("stop_after_no_improvement", 2)),
+        float(evaluation.get("minimum_improvement", 0.01)),
+        bool(evaluation.get("retain_risk_memory", True)),
     )
     counts = (
         evaluation_config.max_candidates,
@@ -137,9 +146,20 @@ def load_task_config(path: Path) -> TaskConfig:
         evaluation_config.human_review_top_k,
         evaluation_config.task_model_max_calls,
         evaluation_config.judge_model_max_calls,
+        evaluation_config.max_rounds,
+        evaluation_config.stop_after_no_improvement,
     )
-    if any(value < 0 for value in counts) or evaluation_config.max_seconds <= 0:
-        raise ValueError("Layered evaluation counts must be non-negative and max_seconds must be positive.")
+    if (
+        any(value < 0 for value in counts)
+        or evaluation_config.max_seconds <= 0
+        or evaluation_config.minimum_improvement < 0
+        or evaluation_config.max_rounds <= 0
+        or evaluation_config.stop_after_no_improvement <= 0
+    ):
+        raise ValueError(
+            "Layered evaluation counts and minimum_improvement must be non-negative, "
+            "and max_seconds must be positive."
+        )
     return TaskConfig(
         path=path, name=str(task["name"]), input_fields=input_fields,
         output_description=str(task["output_description"]), output_schema=task.get("output_schema", {}),

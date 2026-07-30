@@ -295,6 +295,7 @@ class LayeredPromptOptimizer:
         task: TaskSpec,
         signals: SignalSpec,
         budget: LayeredBudget,
+        generation_feedback: str | None = None,
     ) -> list[str]:
         if self.policy.max_candidates == 0:
             return [initial_prompt]
@@ -303,7 +304,8 @@ class LayeredPromptOptimizer:
             initial_prompt,
             task,
             signals,
-            "Generate concise candidates that improve deterministic compliance and ambiguous-boundary handling.",
+            generation_feedback
+            or "Generate concise candidates that improve deterministic compliance and ambiguous-boundary handling.",
         )
         budget.record_generator(self._auxiliary_response(self.generator))
         prompts = [initial_prompt]
@@ -452,6 +454,7 @@ class LayeredPromptOptimizer:
         samples: list[Sample],
         risks: list[dict[str, Any]],
         path: Path,
+        risk_memory_case_ids: Iterable[str] = (),
     ) -> dict[str, Any]:
         if self.case_selector is not None:
             payload = self.case_selector.select(samples, risks, self.policy)
@@ -480,20 +483,38 @@ class LayeredPromptOptimizer:
                 f"{self.policy.judge_max_cases_per_prompt}."
             )
         fixed_set = set(fixed)
+        risk_by_id = {str(item["sample_id"]): item for item in risks}
+        memory = sorted(
+            {
+                str(sample_id)
+                for sample_id in risk_memory_case_ids
+                if str(sample_id) in risk_by_id and str(sample_id) not in fixed_set
+            },
+            key=lambda sample_id: (
+                -float(risk_by_id[sample_id]["risk_score"]),
+                sample_id,
+            ),
+        )
+        available = self.policy.judge_max_cases_per_prompt - len(fixed)
+        risk_slots = min(self.policy.dynamic_top_k, available)
+        memory_limit = risk_slots // 2
+        memory = memory[:memory_limit]
+        memory_set = set(memory)
         dynamic_candidates = [
             item for item in risks
             if item["sample_id"] not in fixed_set
+            and item["sample_id"] not in memory_set
             and not item["hard_failure"]
             and float(item["risk_score"]) > 0
         ]
-        available = self.policy.judge_max_cases_per_prompt - len(fixed)
-        dynamic_limit = min(self.policy.dynamic_top_k, available)
+        dynamic_limit = risk_slots - len(memory)
         dynamic = [str(item["sample_id"]) for item in dynamic_candidates[:dynamic_limit]]
         payload = {
             "policy": asdict(self.policy),
             "fixed_case_ids": fixed,
+            "memory_case_ids": memory,
             "dynamic_case_ids": dynamic,
-            "case_ids": fixed + dynamic,
+            "case_ids": fixed + memory + dynamic,
         }
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         return payload
@@ -739,10 +760,15 @@ class LayeredPromptOptimizer:
         runs_root: Path,
         run_id: str | None = None,
         task_config: dict[str, Any] | None = None,
+        generation_feedback: str | None = None,
+        risk_memory_case_ids: Iterable[str] = (),
+        export_human_review: bool = True,
+        shared_budget: LayeredBudget | None = None,
     ) -> LayeredOptimizationResult:
         if signals.status != "approved":
             raise ValueError("Only an approved SignalSpec can drive a layered optimization run.")
         frozen = list(samples)
+        risk_memory = sorted({str(value) for value in risk_memory_case_ids})
         if not frozen:
             raise ValueError("At least one sample is required.")
         fixed_count = sum(
@@ -768,6 +794,8 @@ class LayeredPromptOptimizer:
                 ).encode()
             ).hexdigest(),
             "policy": asdict(self.policy),
+            "generation_feedback": generation_feedback or "",
+            "risk_memory_case_ids": risk_memory,
         }
         identity = json.loads(json.dumps(identity, ensure_ascii=False))
         identity_path = run_dir / "run_identity.json"
@@ -776,7 +804,7 @@ class LayeredPromptOptimizer:
                 raise ValueError("Resume run identity does not match task, signals, samples, or policy.")
         else:
             identity_path.write_text(json.dumps(identity, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        budget = LayeredBudget(
+        budget = shared_budget or LayeredBudget(
             self.policy.task_model_max_calls,
             self.policy.judge_model_max_calls,
             self.policy.max_seconds,
@@ -785,7 +813,13 @@ class LayeredPromptOptimizer:
         if prompts_path.exists():
             prompts = json.loads(prompts_path.read_text(encoding="utf-8"))["prompts"]
         else:
-            prompts = self._generate_prompts(initial_prompt, task, signals, budget)
+            prompts = self._generate_prompts(
+                initial_prompt,
+                task,
+                signals,
+                budget,
+                generation_feedback,
+            )
             prompts_path.write_text(json.dumps({"prompts": prompts}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         samples_by_id = {sample.id: sample for sample in frozen}
         if len(samples_by_id) != len(frozen):
@@ -793,7 +827,12 @@ class LayeredPromptOptimizer:
         task_rows = self._task_outputs(prompts, frozen, run_dir / "task_outputs.jsonl", budget)
         checks = self._checks(task_rows, samples_by_id, run_dir / "deterministic_checks.jsonl")
         risks = self._risk_scores(prompts, frozen, checks, run_dir / "risk_scores.jsonl")
-        queue = self._select_cases(frozen, risks, run_dir / "judge_queue.json")
+        queue = self._select_cases(
+            frozen,
+            risks,
+            run_dir / "judge_queue.json",
+            risk_memory,
+        )
         judge_rows = self._judge(
             prompts, samples_by_id, task_rows, checks, risks, queue, signals,
             run_dir / "judge_results.jsonl", budget,
@@ -806,10 +845,11 @@ class LayeredPromptOptimizer:
             prompts, checks, judge_rows, stability_rows, queue, task_rows,
             run_dir / "prompt_comparison.json",
         )
-        self._human_review(
-            samples_by_id, risks, checks, judge_rows, task_rows, queue,
-            run_dir / "human_review_top20.csv",
-        )
+        if export_human_review:
+            self._human_review(
+                samples_by_id, risks, checks, judge_rows, task_rows, queue,
+                run_dir / "human_review_top20.csv",
+            )
         champion = comparison[0]
         status = (
             "gold_validated"

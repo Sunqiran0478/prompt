@@ -235,6 +235,8 @@ class LLMPromptGenerator(PromptGenerator):
             ),
         ]
         for fallback in fallbacks:
+            if len(normalized - {current}) >= 2:
+                break
             key = "\n".join(
                 line.rstrip() for line in fallback.replace("\r\n", "\n").splitlines()
             ).strip()
