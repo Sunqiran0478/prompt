@@ -169,11 +169,43 @@ class LLMPromptGenerator(PromptGenerator):
         self.model = model
 
     def propose(self, prompt: str, task: TaskSpec, signal_spec: SignalSpec, feedback: str) -> Iterable[str]:
-        payload = self.model.complete_json(
-            "You improve prompts for a task. Return JSON only; do not evaluate any examples.",
-            json.dumps({"current_prompt": prompt, "task": asdict(task), "signal_spec": asdict(signal_spec),
-                        "feedback": feedback, "required_output": {"candidates": ["prompt text"]}}, ensure_ascii=False))
-        return [str(item) for item in payload.get("candidates", [])]
+        response = self.model._chat(
+            "You improve prompts for a task. Return JSON only; do not evaluate any examples. "
+            "Return exactly two distinct, complete, standalone candidate prompts.",
+            json.dumps({
+                "current_prompt": prompt,
+                "task": asdict(task),
+                "signal_spec": asdict(signal_spec),
+                "feedback": feedback,
+                "required_output": {
+                    "candidates": [
+                        "first complete standalone prompt",
+                        "second complete standalone prompt",
+                    ],
+                },
+            }, ensure_ascii=False),
+        )
+        text = response.text.strip()
+        if text.startswith("```"):
+            lines = text.splitlines()
+            text = "\n".join(lines[1:-1]).strip()
+        payload = json.loads(text)
+        if isinstance(payload, dict):
+            values = payload.get("candidates", [])
+            if not values and isinstance(payload.get("current_prompt"), str):
+                values = [payload["current_prompt"]]
+        elif isinstance(payload, list):
+            values = []
+            for item in payload:
+                if isinstance(item, str):
+                    values.append(item)
+                elif isinstance(item, dict):
+                    values.extend(item.get("candidates", []))
+                    if isinstance(item.get("current_prompt"), str):
+                        values.append(item["current_prompt"])
+        else:
+            values = []
+        return [str(item) for item in values]
 
 
 class ReferenceJudge:

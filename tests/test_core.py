@@ -4,8 +4,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from promptos.adapters import LLMSignalCompiler, ReferenceJudge, RuleBasedDemoModel, TemplatePromptGenerator
-from promptos.core import Budget, PromptOptimizer, RunStore, Sample, SignalEvaluator, SignalSpec, SoftSignal, TaskSpec
+from promptos.adapters import LLMPromptGenerator, LLMSignalCompiler, ReferenceJudge, RuleBasedDemoModel, TemplatePromptGenerator
+from promptos.core import Budget, ModelResponse, PromptOptimizer, RunStore, Sample, SignalEvaluator, SignalSpec, SoftSignal, TaskSpec
 from promptos.provenance import Annotation, apply_annotations, export_review_csv, import_review_csv, select_review_cases
 from promptos.datasets import split_gold_samples, write_split
 from promptos.config import load_task_config
@@ -47,6 +47,22 @@ class PromptOSTests(unittest.TestCase):
         spec = LLMSignalCompiler(ZeroWeightModel()).compile("Return the correct result.")
         self.assertEqual([signal.weight for signal in spec.soft_signals], [0.5, 0.5])
         spec.validate()
+
+    def test_llm_prompt_generator_accepts_fenced_array_response(self):
+        class ArrayResponseModel:
+            def _chat(self, system, user):
+                return ModelResponse(
+                    '```json\n[{"current_prompt":"candidate one"},'
+                    '{"candidates":["candidate two"]}]\n```',
+                    "fake",
+                )
+
+        candidates = list(
+            LLMPromptGenerator(ArrayResponseModel()).propose(
+                "initial", self.task, self.signals, "improve boundaries",
+            )
+        )
+        self.assertEqual(candidates, ["candidate one", "candidate two"])
 
     def test_run_store_records_provenance_without_secrets(self):
         optimizer = PromptOptimizer(RuleBasedDemoModel(), SignalEvaluator(ReferenceJudge()), TemplatePromptGenerator())

@@ -308,6 +308,11 @@ class LayeredPromptOptimizer:
                 prompts.append(value)
             if len(prompts) >= self.policy.max_candidates + 1:
                 break
+        if len(prompts) == 1 and self.policy.max_candidates:
+            raise RuntimeError(
+                "Prompt generator produced no distinct candidates; refusing to run an optimization "
+                "that only evaluates the initial prompt."
+            )
         return prompts
 
     def _task_outputs(
