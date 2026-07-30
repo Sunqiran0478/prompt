@@ -4,8 +4,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from promptos.adapters import ReferenceJudge, RuleBasedDemoModel, TemplatePromptGenerator
-from promptos.core import Budget, PromptOptimizer, RunStore, Sample, SignalEvaluator, SignalSpec, SoftSignal, TaskSpec
+from promptos.adapters import LLMPromptGenerator, LLMSignalCompiler, ReferenceJudge, RuleBasedDemoModel, TemplatePromptGenerator
+from promptos.core import Budget, ModelResponse, PromptOptimizer, RunStore, Sample, SignalEvaluator, SignalSpec, SoftSignal, TaskSpec
 from promptos.provenance import Annotation, apply_annotations, export_review_csv, import_review_csv, select_review_cases
 from promptos.datasets import split_gold_samples, write_split
 from promptos.config import load_task_config
@@ -30,6 +30,57 @@ class PromptOSTests(unittest.TestCase):
         optimizer = PromptOptimizer(RuleBasedDemoModel(), SignalEvaluator(ReferenceJudge()), TemplatePromptGenerator())
         with self.assertRaisesRegex(ValueError, "approved"):
             optimizer.optimize("prompt", self.task, draft, self.samples, Budget(), rounds=0)
+
+    def test_llm_signal_compiler_recovers_from_all_zero_weights(self):
+        class ZeroWeightModel:
+            model = "test-model"
+
+            def complete_json(self, system, user):
+                return {
+                    "hard_constraints": [],
+                    "soft_signals": [
+                        {"name": "correctness", "criterion": "Correct result", "weight": 0},
+                        {"name": "clarity", "criterion": "Clear result", "weight": 0},
+                    ],
+                }
+
+        spec = LLMSignalCompiler(ZeroWeightModel()).compile("Return the correct result.")
+        self.assertEqual([signal.weight for signal in spec.soft_signals], [0.5, 0.5])
+        spec.validate()
+
+    def test_llm_prompt_generator_accepts_fenced_array_response(self):
+        class ArrayResponseModel:
+            def _chat(self, system, user):
+                return ModelResponse(
+                    '```json\n[{"current_prompt":"candidate one"},'
+                    '{"candidates":["candidate two"]}]\n```',
+                    "fake",
+                )
+
+        candidates = list(
+            LLMPromptGenerator(ArrayResponseModel()).propose(
+                "initial", self.task, self.signals, "improve boundaries",
+            )
+        )
+        self.assertEqual(candidates, ["candidate one", "candidate two"])
+
+    def test_llm_prompt_generator_falls_back_to_auditable_candidates(self):
+        class EchoModel:
+            def _chat(self, system, user):
+                return ModelResponse(
+                    '```json\n[{"current_prompt":"initial"}]\n```',
+                    "fake",
+                )
+
+        candidates = list(
+            LLMPromptGenerator(EchoModel()).propose(
+                "initial", self.task, self.signals, "improve boundaries",
+            )
+        )
+        distinct = [value for value in candidates if value != "initial"]
+        self.assertEqual(len(distinct), 2)
+        self.assertIn("路由冲突", distinct[0])
+        self.assertIn("歧义与输出自检", distinct[1])
 
     def test_run_store_records_provenance_without_secrets(self):
         optimizer = PromptOptimizer(RuleBasedDemoModel(), SignalEvaluator(ReferenceJudge()), TemplatePromptGenerator())
@@ -75,6 +126,37 @@ class PromptOSTests(unittest.TestCase):
             config_path.write_text(config_path.read_text().replace('"task_model": "example"', '"api_key": "forbidden"'))
             with self.assertRaisesRegex(ValueError, "credentials"):
                 load_task_config(config_path)
+
+    def test_layered_finance_config_resolves_plugin_and_policy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "task.json"
+            config_path.write_text(json.dumps({
+                "version": 1,
+                "task": {
+                    "name": "finance",
+                    "input_fields": ["query"],
+                    "output_description": "Classify.",
+                },
+                "dataset": {"path": "sample.jsonl"},
+                "signals": {"path": "signals.json"},
+                "models": {"task_model": "deepseek-chat"},
+                "plugin": {
+                    "name": "finance_classification",
+                    "taxonomy_path": "taxonomy.json",
+                },
+                "evaluation": {
+                    "mode": "layered",
+                    "fixed_sample_kinds": ["boundary_probe"],
+                    "dynamic_top_k": 30,
+                    "judge_max_cases_per_prompt": 80,
+                },
+            }))
+            config = load_task_config(config_path)
+            self.assertEqual(config.evaluation.mode, "layered")
+            self.assertEqual(config.evaluation.dynamic_top_k, 30)
+            self.assertEqual(config.plugin.taxonomy_path, root / "taxonomy.json")
+            self.assertEqual(config.optimization.initial_prompt, "")
 
     def test_human_review_csv_only_promotes_explicit_human_decisions(self):
         samples = [Sample("one", {"answer": "claim"})]

@@ -34,9 +34,80 @@ promptos optimize \
   --signals artifacts/signals.json --prompt "处理输入" --runs artifacts/runs
 ```
 
+`optimize` 是兼容模式，会对全量样本调用 Judge。单轮诊断可使用
+`optimize-layered`；希望人工只做最终验收时，推荐使用 `optimize-auto`。
+
 该示例使用本地演示模型。SDK 中也提供 `OpenAICompatibleModel` 与 `LLMJudge`：它们读取运行时环境变量 `OPENAI_API_KEY` 和可选的 `OPENAI_BASE_URL`，不把密钥写入任何文件。
 
 可设置 `PROMPTOS_CACHE_DIR=/local/cache/path` 启用无密钥响应缓存。缓存键包含端点与完整请求体，不包含认证头；网络调用会对 429、5xx 和临时网络错误做指数退避重试。
+
+## 推荐：分层风险优化
+
+分层模式先让任务模型处理所有样本并执行不调用 LLM 的确定性检查，再把固定
+`boundary_probe` 与动态风险 Top-K 合并为统一 Judge 集合。所有 Prompt 候选都在
+同一集合上比较；格式、Schema 或 taxonomy 硬失败不会浪费 Judge 调用。
+
+```bash
+promptos optimize-layered \
+  --dataset samples.jsonl --inputs query \
+  --signals artifacts/signals.json \
+  --plugin finance_classification --taxonomy /absolute/path/taxonomy.json \
+  --model deepseek-chat --judge-model deepseek-reasoner \
+  --max-candidates 2 --dynamic-top-k 30 \
+  --judge-max-cases-per-prompt 80 --human-review-top-k 20 \
+  --runs artifacts/runs
+```
+
+金融数据每行的 `metadata.sample_kind` 为 `boundary_probe` 时固定进入 Judge，
+`metadata.boundary_note` 会连同风险原因、业务 metadata 和各 Prompt 的对比输出传给
+Judge。默认策略是最多 2 个候选、动态 Top 30、每个 Prompt 最多 Judge 80 条、人工
+Review 最多 20 条。若固定边界样本已经超过 80，程序会在任何模型调用前拒绝运行。
+
+每个阶段会立即保存，指定同一 run ID 可以断点恢复：
+
+```bash
+promptos optimize-layered ... --resume-run layered_abc123
+```
+
+运行目录包含 `task_outputs.jsonl`、`deterministic_checks.jsonl`、
+`risk_scores.jsonl`、`judge_queue.json`、`judge_results.jsonl`、
+`prompt_comparison.json`、`human_review_top20.csv` 和 `run.json`。
+`risk_scores.jsonl` 保留每条风险信号的来源与解释。冠军严格按“硬失败更少 →
+边界 Judge 更好 → 动态风险 Judge 更好 → 稳定性更高 → Prompt/Token 更少”的
+字典序产生，不使用隐藏加权分数。无金标实验仍标记为
+`provisional_silver_or_unlabeled`。
+
+## 无人介入的多轮自动优化
+
+`optimize-auto` 将分层评估作为每轮评估引擎，自动执行：
+
+```text
+评估当前 Prompt → 汇总失败模式 → 生成候选 → 分层复评
+→ 更新冠军 → 回归历史风险集合 → 判断停止 → 下一轮
+```
+
+中间不需要人工标注或批准候选。`failure_summary.json` 会把确定性失败、风险信号、
+Judge 低分理由整理成下一轮反馈；已发现的高风险案例进入风险记忆，防止后续修复造成
+回退。人工 Review CSV 只在整个自动循环结束后导出。
+
+```bash
+promptos optimize-auto \
+  --dataset samples.jsonl --inputs query \
+  --signals artifacts/signals.json --prompt-file initial_prompt.md \
+  --plugin finance_classification --taxonomy taxonomy.json \
+  --model deepseek-chat --judge-model deepseek-reasoner \
+  --max-rounds 5 --stop-after-no-improvement 2 \
+  --minimum-improvement 0.01 \
+  --max-candidates 2 --dynamic-top-k 30 \
+  --judge-max-cases-per-prompt 80 \
+  --task-model-max-calls 10000 --judge-model-max-calls 1200 \
+  --runs artifacts/runs
+```
+
+自动运行目录按 `round_00/`、`round_01/` 保存每轮完整证据，并在根目录输出
+`champion_prompt.md`、`final_prompt_comparison.json`、
+`human_review_top20.csv`、`auto_state.json` 和最终 `run.json`。指定
+`--resume-run` 可从未完成轮次继续。
 
 ## 无标注数据与人工审核
 
@@ -142,6 +213,41 @@ PYTHONPATH=src python3 -m promptos.cli run-config --config examples/uppercase.ta
 ```
 
 路径均相对 `task.json` 本身解析。`run-config --prompt "…"` 或 `--model MODEL` 仅覆盖本次运行；其他配置保持冻结。真实网关地址可放在 `models.base_url`，鉴权仍只使用环境变量。
+
+金融分层任务的核心配置如下；`taxonomy_path` 同样相对配置文件解析：
+
+```json
+{
+  "plugin": {
+    "name": "finance_classification",
+    "taxonomy_path": "./taxonomy.json"
+  },
+  "evaluation": {
+    "mode": "layered",
+    "max_candidates": 2,
+    "fixed_sample_kinds": ["boundary_probe"],
+    "dynamic_top_k": 30,
+    "judge_max_cases_per_prompt": 80,
+    "human_review_top_k": 20
+  }
+}
+```
+
+配置为 `evaluation.mode: "layered"` 时，`run-config` 自动路由到单轮分层优化；
+配置为 `layered_auto` 时进入无人介入的多轮闭环；`legacy` 或省略该字段时继续使用
+旧流程。自动模式还支持：
+
+```json
+{
+  "evaluation": {
+    "mode": "layered_auto",
+    "max_rounds": 5,
+    "stop_after_no_improvement": 2,
+    "minimum_improvement": 0.01,
+    "retain_risk_memory": true
+  }
+}
+```
 
 ## 开发
 

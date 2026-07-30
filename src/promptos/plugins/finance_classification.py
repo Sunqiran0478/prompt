@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from promptos.core import HardConstraint, SignalSpec, SoftSignal, TaskSpec
+from promptos.layered import JsonOutputValidator, Violation
 
 
 @dataclass(frozen=True)
@@ -35,6 +36,8 @@ class FinanceTaxonomy:
         return cls(str(raw.get("version", "unknown")), l2_by_l3, names, "\n".join(lines))
 
     def valid(self, l2_id: str, l3_id: str) -> bool:
+        if l2_id not in self.names or not l2_id.startswith("L2-"):
+            return False
         return l3_id == "Unknown" or self.l2_by_l3.get(l3_id) == l2_id
 
 
@@ -93,3 +96,25 @@ def validate_output(value: dict[str, Any], taxonomy: FinanceTaxonomy) -> list[st
     if not 0 <= confidence <= 1:
         return ["valid_json"]
     return [] if taxonomy.valid(str(value["L2_id"]), str(value["L3_id"])) else ["valid_taxonomy"]
+
+
+class FinanceOutputValidator:
+    """Deterministic validation used before any semantic LLM judging."""
+
+    def __init__(self, taxonomy: FinanceTaxonomy):
+        self.taxonomy = taxonomy
+        self.schema_validator = JsonOutputValidator(task_spec().output_schema)
+
+    def validate(self, sample, output: str) -> tuple[Any | None, list[Violation]]:
+        parsed, violations = self.schema_validator.validate(sample, output)
+        if not isinstance(parsed, dict) or violations:
+            return parsed, violations
+        codes = validate_output(parsed, self.taxonomy)
+        if "valid_json" in codes:
+            violations.append(Violation("valid_json", "Finance output fields or confidence are invalid."))
+        if "valid_taxonomy" in codes:
+            violations.append(Violation(
+                "valid_taxonomy",
+                "L2/L3 IDs do not exist or the selected L3 does not belong to the selected L2.",
+            ))
+        return parsed, violations

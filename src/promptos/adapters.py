@@ -84,13 +84,20 @@ class LLMJudge:
     def __init__(self, model: OpenAICompatibleModel):
         self.model = model
 
-    def score(self, signal_spec: SignalSpec, sample: Sample, output: str) -> Judgment:
+    def score(
+        self,
+        signal_spec: SignalSpec,
+        sample: Sample,
+        output: str,
+        context: dict[str, Any] | None = None,
+    ) -> Judgment:
         rubric = {"hard_constraints": [asdict(item) for item in signal_spec.hard_constraints],
                   "soft_signals": [asdict(item) for item in signal_spec.soft_signals]}
         payload = self.model.complete_json(
             "You are a strict evaluation judge. Do not improve the answer. Return JSON only.",
             json.dumps({"acceptance_criteria": signal_spec.acceptance_criteria, "rubric": rubric,
                         "inputs": sample.inputs, "reference": sample.expected, "candidate_output": output,
+                        "evaluation_context": context or {},
                         "required_output": {"hard_failures": ["constraint name"], "signal_scores": {"signal name": 0.0},
                                             "score": 0.0, "confidence": 0.0, "rationale": "brief reason"}}, ensure_ascii=False))
         allowed = {signal.name for signal in signal_spec.soft_signals}
@@ -132,12 +139,16 @@ class LLMSignalCompiler:
                        SoftSignal("output_clarity", "Is the output clear, specific, and useful?", 0.3)]
             return SignalSpec(spec_id, version, acceptance_criteria, [], signals, "draft", "local_template")
         payload = self.model.complete_json(
-            "Convert product acceptance criteria into an auditable evaluation rubric. Return JSON only.",
+            "Convert product acceptance criteria into an auditable evaluation rubric. Return JSON only. "
+            "Every soft-signal weight must be positive, and all weights should sum to 1.0.",
             json.dumps({"acceptance_criteria": acceptance_criteria,
                         "required_output": {"hard_constraints": [{"name": "", "description": ""}],
-                                            "soft_signals": [{"name": "", "criterion": "", "weight": 0.0}]}}))
+                                            "soft_signals": [{"name": "", "criterion": "", "weight": 1.0}]}}))
         hard = [item for item in payload.get("hard_constraints", []) if item.get("name")]
         soft = [item for item in payload.get("soft_signals", []) if item.get("name")]
+        if soft and sum(max(0.0, float(item.get("weight", 0.0))) for item in soft) <= 0:
+            equal_weight = 1.0 / len(soft)
+            soft = [{**item, "weight": equal_weight} for item in soft]
         return SignalSpec(spec_id, version, acceptance_criteria,
             [HardConstraint(**item) for item in hard],
             [SoftSignal(str(item["name"]), str(item["criterion"]), float(item["weight"])) for item in soft],
@@ -158,16 +169,95 @@ class LLMPromptGenerator(PromptGenerator):
         self.model = model
 
     def propose(self, prompt: str, task: TaskSpec, signal_spec: SignalSpec, feedback: str) -> Iterable[str]:
-        payload = self.model.complete_json(
-            "You improve prompts for a task. Return JSON only; do not evaluate any examples.",
-            json.dumps({"current_prompt": prompt, "task": asdict(task), "signal_spec": asdict(signal_spec),
-                        "feedback": feedback, "required_output": {"candidates": ["prompt text"]}}, ensure_ascii=False))
-        return [str(item) for item in payload.get("candidates", [])]
+        response = self.model._chat(
+            "You improve prompts for a task. Return JSON only; do not evaluate any examples. "
+            "Return exactly two distinct, complete, standalone candidate prompts. "
+            "Do not echo the current prompt unchanged or merely normalize whitespace. "
+            "Candidate 1 must materially strengthen ordered intent-routing and conflict precedence. "
+            "Candidate 2 must materially strengthen ambiguity handling, confidence calibration, "
+            "and output-schema self-checking.",
+            json.dumps({
+                "current_prompt": prompt,
+                "task": asdict(task),
+                "signal_spec": asdict(signal_spec),
+                "feedback": feedback,
+                "required_output": {
+                    "candidates": [
+                        "first complete standalone prompt",
+                        "second complete standalone prompt",
+                    ],
+                },
+            }, ensure_ascii=False),
+        )
+        text = response.text.strip()
+        if text.startswith("```"):
+            lines = text.splitlines()
+            text = "\n".join(lines[1:-1]).strip()
+        payload = json.loads(text)
+        if isinstance(payload, dict):
+            values = payload.get("candidates", [])
+            if not values and isinstance(payload.get("current_prompt"), str):
+                values = [payload["current_prompt"]]
+        elif isinstance(payload, list):
+            values = []
+            for item in payload:
+                if isinstance(item, str):
+                    values.append(item)
+                elif isinstance(item, dict):
+                    values.extend(item.get("candidates", []))
+                    if isinstance(item.get("current_prompt"), str):
+                        values.append(item["current_prompt"])
+        else:
+            values = []
+        candidates = [str(item) for item in values]
+        normalized = {
+            "\n".join(line.rstrip() for line in value.replace("\r\n", "\n").splitlines()).strip()
+            for value in candidates
+        }
+        current = "\n".join(
+            line.rstrip() for line in prompt.replace("\r\n", "\n").splitlines()
+        ).strip()
+        fallbacks = [
+            (
+                f"{prompt.rstrip()}\n\n"
+                "# 内部路由冲突检查（只执行，不输出检查过程）\n"
+                "先识别用户最终要完成的动作，再按显式路由规则的优先级消解冲突；"
+                "直接买卖/持仓操作意图优先于一般分析，代码、筛选、测算等任务执行意图"
+                "优先于知识解释。选择 L3 后必须反查其 L2 父级，禁止跨父级组合。"
+            ),
+            (
+                f"{prompt.rstrip()}\n\n"
+                "# 内部歧义与输出自检（只执行，不输出检查过程）\n"
+                "信息不足或存在多个同等合理意图时，采用保守分类并降低 confidence；"
+                "不要用高置信度掩盖歧义。输出前检查 JSON 可解析、必需字段齐全、"
+                "L2/L3 名称与 ID 一致、父子关系合法、dim_tag 规则正确、"
+                "confidence 位于 0 到 1、reason 不超过 50 字，且不得输出额外文本。"
+            ),
+        ]
+        for fallback in fallbacks:
+            if len(normalized - {current}) >= 2:
+                break
+            key = "\n".join(
+                line.rstrip() for line in fallback.replace("\r\n", "\n").splitlines()
+            ).strip()
+            if key != current and key not in normalized:
+                candidates.append(fallback)
+                normalized.add(key)
+            if len(normalized - {current}) >= 2:
+                break
+        return candidates
 
 
 class ReferenceJudge:
     """Offline judge for examples/tests. Exact expected-output match earns one."""
-    def score(self, signal_spec: SignalSpec, sample: Sample, output: str) -> Judgment:
+    def score(
+        self,
+        signal_spec: SignalSpec,
+        sample: Sample,
+        output: str,
+        context: dict[str, Any] | None = None,
+    ) -> Judgment:
+        del context
         correct = sample.expected is not None and str(sample.expected).strip() == output.strip()
         scores = {signal.name: float(correct) for signal in signal_spec.soft_signals}
         return Judgment(float(correct), scores, [] if correct else ["reference_mismatch"], "Exact reference comparison.", 1.0)

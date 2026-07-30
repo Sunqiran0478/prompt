@@ -7,5 +7,6 @@ build/
 dist/
 *.egg-info/
 artifacts/
+.promptos-cache/
 .env
 .DS_Store
