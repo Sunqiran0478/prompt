@@ -255,6 +255,11 @@ def _confidence(parsed: Any | None) -> float | None:
     return value if 0 <= value <= 1 else None
 
 
+def _prompt_key(value: str) -> str:
+    """Ignore newline style and trailing whitespace when comparing candidates."""
+    return "\n".join(line.rstrip() for line in value.replace("\r\n", "\n").split("\n")).strip()
+
+
 class LayeredPromptOptimizer:
     def __init__(
         self,
@@ -302,10 +307,13 @@ class LayeredPromptOptimizer:
         )
         budget.record_generator(self._auxiliary_response(self.generator))
         prompts = [initial_prompt]
+        prompt_keys = {_prompt_key(initial_prompt)}
         for item in proposed:
             value = str(item).strip()
-            if value and value not in prompts:
+            key = _prompt_key(value)
+            if value and key not in prompt_keys:
                 prompts.append(value)
+                prompt_keys.add(key)
             if len(prompts) >= self.policy.max_candidates + 1:
                 break
         if len(prompts) == 1 and self.policy.max_candidates:

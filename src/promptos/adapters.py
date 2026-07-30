@@ -171,7 +171,11 @@ class LLMPromptGenerator(PromptGenerator):
     def propose(self, prompt: str, task: TaskSpec, signal_spec: SignalSpec, feedback: str) -> Iterable[str]:
         response = self.model._chat(
             "You improve prompts for a task. Return JSON only; do not evaluate any examples. "
-            "Return exactly two distinct, complete, standalone candidate prompts.",
+            "Return exactly two distinct, complete, standalone candidate prompts. "
+            "Do not echo the current prompt unchanged or merely normalize whitespace. "
+            "Candidate 1 must materially strengthen ordered intent-routing and conflict precedence. "
+            "Candidate 2 must materially strengthen ambiguity handling, confidence calibration, "
+            "and output-schema self-checking.",
             json.dumps({
                 "current_prompt": prompt,
                 "task": asdict(task),

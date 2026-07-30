@@ -174,6 +174,27 @@ class LayeredEvaluationTests(unittest.TestCase):
             optimizer.optimize("baseline", task_spec(), approved_signals(), samples, self.tmp_path)
         self.assertEqual(model.calls, 0)
 
+    def test_candidate_with_only_newline_changes_is_rejected(self):
+        class WhitespaceOnlyGenerator:
+            def propose(self, prompt, task, signal_spec, feedback):
+                return [prompt.replace("\n", "\r\n")]
+
+        optimizer = LayeredPromptOptimizer(
+            FakeTaskModel(),
+            FakeJudge(),
+            WhitespaceOnlyGenerator(),
+            JsonOutputValidator(task_spec().output_schema),
+            LayeredEvaluationPolicy(max_candidates=1),
+        )
+        with self.assertRaisesRegex(RuntimeError, "no distinct candidates"):
+            optimizer.optimize(
+                "line one\nline two",
+                task_spec(),
+                approved_signals(),
+                [Sample("safe", {"id": "safe"})],
+                self.tmp_path,
+            )
+
 
     def test_finance_validator_rejects_invalid_taxonomy_and_schema(self):
         taxonomy = FinanceTaxonomy(
