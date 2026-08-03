@@ -12,6 +12,7 @@ import json
 import time
 import uuid
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Protocol
@@ -54,6 +55,7 @@ class LayeredEvaluationPolicy:
     max_seconds: float = 7200.0
     low_confidence_threshold: float = 0.65
     distribution_concentration_threshold: float = 0.40
+    judge_workers: int = 1
 
     def validate(self) -> None:
         integer_values = {
@@ -63,6 +65,7 @@ class LayeredEvaluationPolicy:
             "human_review_top_k": self.human_review_top_k,
             "task_model_max_calls": self.task_model_max_calls,
             "judge_model_max_calls": self.judge_model_max_calls,
+            "judge_workers": self.judge_workers,
         }
         if any(value < 0 for value in integer_values.values()):
             raise ValueError(f"Layered policy counts cannot be negative: {integer_values}")
@@ -296,6 +299,7 @@ class LayeredPromptOptimizer:
         signals: SignalSpec,
         budget: LayeredBudget,
         generation_feedback: str | None = None,
+        metadata_path: Path | None = None,
     ) -> list[str]:
         if self.policy.max_candidates == 0:
             return [initial_prompt]
@@ -307,7 +311,20 @@ class LayeredPromptOptimizer:
             generation_feedback
             or "Generate concise candidates that improve deterministic compliance and ambiguous-boundary handling.",
         )
-        budget.record_generator(self._auxiliary_response(self.generator))
+        response = self._auxiliary_response(self.generator)
+        budget.record_generator(response)
+        if metadata_path is not None:
+            metadata = {
+                "model": response.model if response else "unavailable",
+                "input_tokens": response.input_tokens if response else None,
+                "output_tokens": response.output_tokens if response else None,
+                "cost_usd": response.cost_usd if response else None,
+                "cached": bool(response.raw.get("_promptos_cached")) if response else None,
+            }
+            metadata_path.write_text(
+                json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
         prompts = [initial_prompt]
         prompt_keys = {_prompt_key(initial_prompt)}
         for item in proposed:
@@ -352,6 +369,7 @@ class LayeredPromptOptimizer:
                     "input_tokens": response.input_tokens,
                     "output_tokens": response.output_tokens,
                     "cost_usd": response.cost_usd,
+                    "cached": bool(response.raw.get("_promptos_cached")),
                 })
                 _write_jsonl(path, rows)
         return rows
@@ -530,6 +548,8 @@ class LayeredPromptOptimizer:
         signals: SignalSpec,
         path: Path,
         budget: LayeredBudget,
+        comparative: bool = False,
+        identical_calibration_k: int = 10,
     ) -> list[dict[str, Any]]:
         rows = _json_line_records(path)
         completed = {(int(row["prompt_index"]), str(row["sample_id"])) for row in rows}
@@ -543,6 +563,21 @@ class LayeredPromptOptimizer:
             }
             for sample_id in queue["case_ids"]
         }
+        if comparative:
+            return self._judge_comparative(
+                prompts,
+                samples_by_id,
+                check_map,
+                risk_map,
+                queue,
+                signals,
+                path,
+                budget,
+                rows,
+                comparison_outputs,
+                identical_calibration_k,
+            )
+        jobs: list[tuple[int, str, Sample, dict[str, Any]]] = []
         for prompt_index, _prompt in enumerate(prompts):
             for sample_id in queue["case_ids"]:
                 key = (prompt_index, sample_id)
@@ -551,9 +586,6 @@ class LayeredPromptOptimizer:
                 check = check_map[key]
                 if check["hard_failure"]:
                     continue
-                budget.check_time()
-                if budget.judge_calls >= budget.judge_model_max_calls:
-                    raise RuntimeError("Layered budget exhausted: judge-model call limit reached.")
                 sample = samples_by_id[sample_id]
                 context = {
                     "metadata": sample.metadata,
@@ -562,17 +594,131 @@ class LayeredPromptOptimizer:
                     "comparison_outputs": comparison_outputs[sample_id],
                     "prompt_index": prompt_index,
                 }
-                judgment = self.judge.score(signals, sample, output_map[key], context)
-                response = self._auxiliary_response(self.judge)
+                jobs.append((prompt_index, sample_id, sample, context))
+        budget.check_time()
+        if budget.judge_calls + len(jobs) > budget.judge_model_max_calls:
+            raise RuntimeError("Layered budget exhausted: judge-model call limit reached.")
+
+        def execute(
+            job: tuple[int, str, Sample, dict[str, Any]],
+        ) -> tuple[dict[str, Any], ModelResponse | None]:
+            prompt_index, sample_id, sample, context = job
+            judgment = self.judge.score(
+                signals,
+                sample,
+                output_map[(prompt_index, sample_id)],
+                context,
+            )
+            row = {
+                "prompt_index": prompt_index,
+                "sample_id": sample_id,
+                "set": "fixed" if sample_id in set(queue["fixed_case_ids"]) else "dynamic",
+                "judgment": asdict(judgment),
+                "context": context,
+            }
+            return row, self._auxiliary_response(self.judge)
+
+        if self.policy.judge_workers == 1:
+            for job in jobs:
+                row, response = execute(job)
                 budget.record_judge(response)
+                rows.append(row)
+                _write_jsonl(path, rows)
+        else:
+            with ThreadPoolExecutor(max_workers=self.policy.judge_workers) as executor:
+                futures = [executor.submit(execute, job) for job in jobs]
+                for future in as_completed(futures):
+                    row, response = future.result()
+                    budget.record_judge(response)
+                    rows.append(row)
+                    _write_jsonl(path, rows)
+        return rows
+
+    def _judge_comparative(
+        self,
+        prompts: list[str],
+        samples_by_id: dict[str, Sample],
+        check_map: dict[tuple[int, str], dict[str, Any]],
+        risk_map: dict[str, dict[str, Any]],
+        queue: dict[str, Any],
+        signals: SignalSpec,
+        path: Path,
+        budget: LayeredBudget,
+        rows: list[dict[str, Any]],
+        comparison_outputs: dict[str, dict[str, str]],
+        identical_calibration_k: int,
+    ) -> list[dict[str, Any]]:
+        compare = getattr(self.judge, "compare", None)
+        if not callable(compare):
+            raise TypeError("Comparative Judge strategy requires a judge.compare method.")
+        completed_counts = Counter(str(row["sample_id"]) for row in rows)
+        completed = {
+            sample_id for sample_id, count in completed_counts.items()
+            if count >= len(prompts)
+        }
+        disagreements, identical = [], []
+        for sample_id in queue["case_ids"]:
+            labels = {
+                str(check_map[(prompt_index, sample_id)]["label_key"])
+                for prompt_index in range(len(prompts))
+            }
+            hard_failure = any(
+                bool(check_map[(prompt_index, sample_id)]["hard_failure"])
+                for prompt_index in range(len(prompts))
+            )
+            (disagreements if len(labels) > 1 or hard_failure else identical).append(sample_id)
+        selected = disagreements + identical[:max(0, identical_calibration_k)]
+        queue["judge_strategy"] = "comparative_multi_candidate"
+        queue["comparative_disagreement_case_ids"] = disagreements
+        queue["comparative_calibration_case_ids"] = identical[:max(0, identical_calibration_k)]
+        queue["comparative_case_ids"] = selected
+        (path.parent / "judge_queue.json").write_text(
+            json.dumps(queue, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        fixed = set(queue["fixed_case_ids"])
+        for sample_id in selected:
+            if sample_id in completed:
+                continue
+            budget.check_time()
+            if budget.judge_calls >= budget.judge_model_max_calls:
+                raise RuntimeError("Layered budget exhausted: judge-model call limit reached.")
+            sample = samples_by_id[sample_id]
+            context = {
+                "metadata": sample.metadata,
+                "boundary_note": sample.metadata.get("boundary_note"),
+                "risk_reasons": risk_map[sample_id]["risk_signals"],
+                "comparison_outputs": comparison_outputs[sample_id],
+                "deterministic_checks": {
+                    str(index): check_map[(index, sample_id)] for index in range(len(prompts))
+                },
+                "judge_strategy": "comparative_multi_candidate",
+            }
+            judgments = compare(
+                signals,
+                sample,
+                {
+                    index: comparison_outputs[sample_id][str(index)]
+                    for index in range(len(prompts))
+                },
+                context,
+            )
+            response = self._auxiliary_response(self.judge)
+            budget.record_judge(response)
+            call_id = hashlib.sha256(
+                f"{path.parent.name}:{sample_id}".encode()
+            ).hexdigest()[:16]
+            for prompt_index in range(len(prompts)):
                 rows.append({
                     "prompt_index": prompt_index,
                     "sample_id": sample_id,
-                    "set": "fixed" if sample_id in set(queue["fixed_case_ids"]) else "dynamic",
-                    "judgment": asdict(judgment),
+                    "set": "fixed" if sample_id in fixed else "dynamic",
+                    "judgment": asdict(judgments[prompt_index]),
                     "context": context,
+                    "judge_strategy": "comparative_multi_candidate",
+                    "shared_call_id": call_id,
                 })
-                _write_jsonl(path, rows)
+            _write_jsonl(path, rows)
         return rows
 
     def _stability(
@@ -604,6 +750,11 @@ class LayeredPromptOptimizer:
                     "sample_id": sample_id,
                     "output": response.text,
                     "stable": _label_key(first_parsed, original[key]) == _label_key(second_parsed, response.text),
+                    "model": response.model,
+                    "input_tokens": response.input_tokens,
+                    "output_tokens": response.output_tokens,
+                    "cost_usd": response.cost_usd,
+                    "cached": bool(response.raw.get("_promptos_cached")),
                 })
                 _write_jsonl(path, rows)
         return rows
@@ -764,6 +915,8 @@ class LayeredPromptOptimizer:
         risk_memory_case_ids: Iterable[str] = (),
         export_human_review: bool = True,
         shared_budget: LayeredBudget | None = None,
+        comparative_judge: bool = False,
+        identical_calibration_k: int = 10,
     ) -> LayeredOptimizationResult:
         if signals.status != "approved":
             raise ValueError("Only an approved SignalSpec can drive a layered optimization run.")
@@ -797,6 +950,11 @@ class LayeredPromptOptimizer:
             "generation_feedback": generation_feedback or "",
             "risk_memory_case_ids": risk_memory,
         }
+        if comparative_judge:
+            identity["judge_strategy"] = {
+                "name": "comparative_multi_candidate",
+                "identical_calibration_k": identical_calibration_k,
+            }
         identity = json.loads(json.dumps(identity, ensure_ascii=False))
         identity_path = run_dir / "run_identity.json"
         if identity_path.exists():
@@ -819,6 +977,7 @@ class LayeredPromptOptimizer:
                 signals,
                 budget,
                 generation_feedback,
+                run_dir / "generator_metadata.json",
             )
             prompts_path.write_text(json.dumps({"prompts": prompts}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         samples_by_id = {sample.id: sample for sample in frozen}
@@ -836,6 +995,8 @@ class LayeredPromptOptimizer:
         judge_rows = self._judge(
             prompts, samples_by_id, task_rows, checks, risks, queue, signals,
             run_dir / "judge_results.jsonl", budget,
+            comparative=comparative_judge,
+            identical_calibration_k=identical_calibration_k,
         )
         stability_rows = self._stability(
             prompts, samples_by_id, task_rows, queue,

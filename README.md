@@ -109,6 +109,14 @@ promptos optimize-auto \
 `human_review_top20.csv`、`auto_state.json` 和最终 `run.json`。指定
 `--resume-run` 可从未完成轮次继续。
 
+每轮完成后还会以零额外模型调用生成 `experiment_report.md` 和
+`report_manifest.json`。主报告汇总模型、预算、风险漏斗、候选排名、Judge、
+标签分布、稳定性和人工验收队列；每轮目录中的 `risk_case_details.csv` 按
+“风险样本 × 候选 Prompt”保存完整标签、硬约束、Judge 理由与实际 Judge 模型，
+`prompt_evolution.md` 保存完整 Prompt 和确定性变化摘要。中断运行的报告标记为
+`incomplete`，恢复后会幂等重建。原始 Query 会进入本地审计附表，因此不要自动
+公开或上传包含真实敏感数据的运行目录。
+
 ## 无标注数据与人工审核
 
 ```bash
@@ -213,6 +221,25 @@ PYTHONPATH=src python3 -m promptos.cli run-config --config examples/uppercase.ta
 ```
 
 路径均相对 `task.json` 本身解析。`run-config --prompt "…"` 或 `--model MODEL` 仅覆盖本次运行；其他配置保持冻结。真实网关地址可放在 `models.base_url`，鉴权仍只使用环境变量。
+
+DeepSeek 的 JSON Output 可在任务模型配置中显式开启：
+
+```json
+{
+  "models": {
+    "task_model": "deepseek-chat",
+    "base_url": "https://api.deepseek.com/v1",
+    "task_response_format": "json_object",
+    "task_max_tokens": 2048
+  }
+}
+```
+
+直接使用 CLI 时，对应参数为 `--response-format json_object --max-tokens 2048`。
+`finance_classification` 插件默认启用这两个设置；配置文件中的显式值优先。适配器会把
+`response_format: {"type": "json_object"}` 发送给兼容接口，并在返回空内容、非法 JSON
+或非对象 JSON 时按既有重试策略重试。结构化与普通文本请求使用不同缓存键，避免复用旧的
+非结构化响应。Prompt 仍应明确包含 “JSON” 及预期结构。
 
 金融分层任务的核心配置如下；`taxonomy_path` 同样相对配置文件解析：
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import hashlib
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -19,14 +20,40 @@ class OpenAICompatibleModel:
     API keys are read from the environment at runtime and are never persisted.
     """
 
-    def __init__(self, model: str, base_url: str | None = None, api_key_env: str = "OPENAI_API_KEY", temperature: float = 0.0,
-                 max_retries: int = 3, cache_dir: str | None = None, input_token_usd: float = 0.0, output_token_usd: float = 0.0):
+    def __init__(
+        self,
+        model: str,
+        base_url: str | None = None,
+        api_key_env: str = "OPENAI_API_KEY",
+        temperature: float = 0.0,
+        max_retries: int = 3,
+        cache_dir: str | None = None,
+        input_token_usd: float = 0.0,
+        output_token_usd: float = 0.0,
+        response_format: str | None = None,
+        max_tokens: int | None = None,
+    ):
+        if response_format not in {None, "text", "json_object"}:
+            raise ValueError("response_format must be text or json_object.")
+        if max_tokens is not None and max_tokens <= 0:
+            raise ValueError("max_tokens must be positive.")
         self.model = model
         self.base_url = (base_url or os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")).rstrip("/")
         self.api_key_env, self.temperature = api_key_env, temperature
         self.max_retries = max_retries
         self.cache_dir = cache_dir or os.environ.get("PROMPTOS_CACHE_DIR")
         self.input_token_usd, self.output_token_usd = input_token_usd, output_token_usd
+        self.response_format = response_format
+        self.max_tokens = max_tokens
+        self._response_local = threading.local()
+
+    @property
+    def last_response(self) -> ModelResponse | None:
+        return getattr(self._response_local, "value", None)
+
+    @last_response.setter
+    def last_response(self, value: ModelResponse | None) -> None:
+        self._response_local.value = value
 
     def _cache_path(self, body: bytes) -> str | None:
         if not self.cache_dir:
@@ -38,22 +65,47 @@ class OpenAICompatibleModel:
         key = os.environ.get(self.api_key_env)
         if not key:
             raise RuntimeError(f"Missing {self.api_key_env}; provide it only as an environment variable.")
-        body = json.dumps({"model": self.model, "temperature": self.temperature,
-                           "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}).encode()
+        request_body: dict[str, Any] = {
+            "model": self.model,
+            "temperature": self.temperature,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+        }
+        if self.response_format:
+            request_body["response_format"] = {"type": self.response_format}
+        if self.max_tokens is not None:
+            request_body["max_tokens"] = self.max_tokens
+        body = json.dumps(request_body).encode()
         cache_path = self._cache_path(body)
         if cache_path and os.path.exists(cache_path):
             with open(cache_path, encoding="utf-8") as file:
                 payload = json.load(file)
-            payload["_promptos_cached"] = True
+            if self._valid_structured_payload(payload):
+                payload["_promptos_cached"] = True
+            else:
+                payload = None
         else:
+            payload = None
+        if payload is None:
             request = urllib.request.Request(f"{self.base_url}/chat/completions", data=body,
                 headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
             for attempt in range(self.max_retries + 1):
                 try:
                     with urllib.request.urlopen(request, timeout=120) as response:
                         payload = json.loads(response.read())
+                    if not self._valid_structured_payload(payload):
+                        raise ValueError(
+                            "JSON Output returned empty, invalid, or non-object content."
+                        )
                     break
-                except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as error:
+                except (
+                    urllib.error.HTTPError,
+                    urllib.error.URLError,
+                    TimeoutError,
+                    ValueError,
+                ) as error:
                     status = getattr(error, "code", 0)
                     if attempt >= self.max_retries or (status and status < 429 and status < 500):
                         raise RuntimeError(f"Chat request failed after {attempt + 1} attempt(s): {error}") from error
@@ -69,11 +121,26 @@ class OpenAICompatibleModel:
         self.last_response = response
         return response
 
+    def _valid_structured_payload(self, payload: dict[str, Any]) -> bool:
+        if self.response_format != "json_object":
+            return True
+        try:
+            content = payload["choices"][0]["message"]["content"]
+            value = json.loads(content)
+        except (KeyError, IndexError, TypeError, json.JSONDecodeError):
+            return False
+        return isinstance(value, dict)
+
     def generate(self, prompt: str, inputs: dict[str, Any]) -> ModelResponse:
         return self._chat(prompt, json.dumps(inputs, ensure_ascii=False, indent=2))
 
     def complete_json(self, system: str, user: str) -> dict[str, Any]:
         text = self._chat(system, user).text
+        if self.response_format == "json_object":
+            value = json.loads(text)
+            if not isinstance(value, dict):
+                raise ValueError("Model did not return a JSON object.")
+            return value
         start, end = text.find("{"), text.rfind("}")
         if start < 0 or end < start:
             raise ValueError("Model did not return a JSON object.")
@@ -100,6 +167,15 @@ class LLMJudge:
                         "evaluation_context": context or {},
                         "required_output": {"hard_failures": ["constraint name"], "signal_scores": {"signal name": 0.0},
                                             "score": 0.0, "confidence": 0.0, "rationale": "brief reason"}}, ensure_ascii=False))
+        response = getattr(self.model, "last_response", None)
+        return self._judgment(signal_spec, payload, response)
+
+    def _judgment(
+        self,
+        signal_spec: SignalSpec,
+        payload: dict[str, Any],
+        response: ModelResponse | None,
+    ) -> Judgment:
         allowed = {signal.name for signal in signal_spec.soft_signals}
         scores = {str(key): max(0.0, min(1.0, float(value))) for key, value in payload.get("signal_scores", {}).items()
                   if str(key) in allowed}
@@ -107,13 +183,110 @@ class LLMJudge:
         weighted = sum(scores.get(name, 0.0) * weight for name, weight in weights.items()) / sum(weights.values())
         declared_hard = {item.name for item in signal_spec.hard_constraints}
         hard = [str(item) for item in payload.get("hard_failures", []) if str(item) in declared_hard]
-        response = getattr(self.model, "last_response", None)
         if response:
             payload = {**payload, "_promptos_judge_model": response.model,
                        "_promptos_judge_tokens": response.input_tokens + response.output_tokens,
-                       "_promptos_judge_cost_usd": response.cost_usd}
+                       "_promptos_judge_cost_usd": response.cost_usd,
+                       "_promptos_judge_cached": bool(response.raw.get("_promptos_cached"))}
         return Judgment(0.0 if hard else max(0.0, min(1.0, weighted)), scores, hard,
                         str(payload.get("rationale", "")), float(payload.get("confidence", 0.0)), payload)
+
+    def compare(
+        self,
+        signal_spec: SignalSpec,
+        sample: Sample,
+        outputs: dict[int, str],
+        context: dict[str, Any] | None = None,
+    ) -> dict[int, Judgment]:
+        """Score all Prompt outputs for one case in a single, anonymized Judge call."""
+        rubric = {
+            "hard_constraints": [asdict(item) for item in signal_spec.hard_constraints],
+            "soft_signals": [asdict(item) for item in signal_spec.soft_signals],
+        }
+        aliases = {index: f"candidate_{index}" for index in sorted(outputs)}
+        required = {
+            alias: {
+                "hard_failures": ["constraint name"],
+                "signal_scores": {"signal name": 0.0},
+                "confidence": 0.0,
+                "rationale": "brief reason",
+            }
+            for alias in aliases.values()
+        }
+        request_payload = {
+                "acceptance_criteria": signal_spec.acceptance_criteria,
+                "rubric": rubric,
+                "inputs": sample.inputs,
+                "reference": sample.expected,
+                "evaluation_context": context or {},
+                "candidates": {
+                    aliases[index]: outputs[index] for index in sorted(outputs)
+                },
+                "required_output": {
+                    "candidate_judgments": required,
+                    "preferred_candidate": "candidate_0",
+                    "case_confidence": 0.0,
+                },
+            }
+        payload: dict[str, Any] = {}
+        responses: list[ModelResponse] = []
+        missing: list[str] = list(aliases.values())
+        for semantic_attempt in range(3):
+            system = (
+                "You are a strict comparative evaluation judge. Evaluate every anonymized "
+                "candidate independently under the same rubric, then compare them. Do not improve "
+                "answers. Return JSON only. You MUST include exactly one object under "
+                f"candidate_judgments for every alias: {', '.join(aliases.values())}."
+            )
+            if semantic_attempt:
+                system += (
+                    f" Previous output was incomplete (missing: {', '.join(missing)}); "
+                    "return the complete object from scratch."
+                )
+            payload = self.model.complete_json(
+                system,
+                json.dumps(request_payload, ensure_ascii=False),
+            )
+            response = getattr(self.model, "last_response", None)
+            if response is not None:
+                responses.append(response)
+            values = payload.get("candidate_judgments", {})
+            missing = [
+                alias for alias in aliases.values()
+                if not isinstance(values, dict) or not isinstance(values.get(alias), dict)
+            ]
+            if not missing:
+                break
+        if missing:
+            raise ValueError(
+                "Comparative Judge omitted candidate judgments after 3 attempts: "
+                + ", ".join(missing)
+            )
+        response = responses[-1] if responses else None
+        if response is not None and len(responses) > 1:
+            response = ModelResponse(
+                text=response.text,
+                model=response.model,
+                input_tokens=sum(item.input_tokens for item in responses),
+                output_tokens=sum(item.output_tokens for item in responses),
+                cost_usd=sum(item.cost_usd for item in responses),
+                raw={**response.raw, "_promptos_semantic_attempts": len(responses)},
+            )
+            self.model.last_response = response
+        values = payload["candidate_judgments"]
+        judgments: dict[int, Judgment] = {}
+        for index, alias in aliases.items():
+            value = values.get(alias)
+            if not isinstance(value, dict):
+                raise ValueError(f"Comparative Judge omitted {alias}.")
+            enriched = {
+                **value,
+                "_promptos_comparative": True,
+                "_promptos_preferred_candidate": payload.get("preferred_candidate"),
+                "_promptos_case_confidence": payload.get("case_confidence"),
+            }
+            judgments[index] = self._judgment(signal_spec, enriched, response)
+        return judgments
 
 
 class LLMSilverAnnotator:
