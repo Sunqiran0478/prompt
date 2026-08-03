@@ -119,10 +119,14 @@ class PromptOSTests(unittest.TestCase):
             config_path = root / "task.json"
             config_path.write_text(json.dumps({"version": 1, "task": {"name": "fact-check", "input_fields": ["answer"], "output_description": "Return a verdict."},
                                                 "dataset": {"path": "data.jsonl", "expected_field": "verdict"}, "signals": {"path": "signals.json"},
-                                                "models": {"task_model": "example"}, "optimization": {"initial_prompt": "Check facts."}}))
+                                                "models": {"task_model": "example", "task_response_format": "json_object",
+                                                           "task_max_tokens": 2048},
+                                                "optimization": {"initial_prompt": "Check facts."}}))
             config = load_task_config(config_path)
             self.assertEqual(config.dataset.path, root / "data.jsonl")
             self.assertEqual(config.signal_spec, root / "signals.json")
+            self.assertEqual(config.models.task_response_format, "json_object")
+            self.assertEqual(config.models.task_max_tokens, 2048)
             config_path.write_text(config_path.read_text().replace('"task_model": "example"', '"api_key": "forbidden"'))
             with self.assertRaisesRegex(ValueError, "credentials"):
                 load_task_config(config_path)

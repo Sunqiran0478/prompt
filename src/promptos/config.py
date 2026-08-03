@@ -21,6 +21,8 @@ class ModelConfig:
     judge_model: str | None = None
     generator_model: str | None = None
     base_url: str | None = None
+    task_response_format: str | None = None
+    task_max_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -54,6 +56,8 @@ class EvaluationConfig:
     stop_after_no_improvement: int = 2
     minimum_improvement: float = 0.01
     retain_risk_memory: bool = True
+    first_round_hard_failure_stop_count: int | None = None
+    judge_workers: int = 1
 
 
 @dataclass(frozen=True)
@@ -112,8 +116,21 @@ def load_task_config(path: Path) -> TaskConfig:
     if not isinstance(input_fields, list) or not all(isinstance(field, str) and field for field in input_fields):
         raise ValueError("task.input_fields must be a non-empty list of strings.")
     models = raw.get("models", {})
-    if any("key" in key.lower() or "token" in key.lower() or "secret" in key.lower() for key in models):
+    if any(
+        key.lower() in {
+            "key", "token", "secret", "api_key", "auth_token",
+            "access_token", "bearer_token", "client_secret",
+        }
+        or key.lower().endswith(("_api_key", "_token", "_secret"))
+        for key in models
+    ):
         raise ValueError("Do not store credentials in task config; use environment variables.")
+    task_response_format = models.get("task_response_format")
+    if task_response_format not in {None, "text", "json_object"}:
+        raise ValueError("models.task_response_format must be text or json_object.")
+    task_max_tokens = models.get("task_max_tokens")
+    if task_max_tokens is not None and int(task_max_tokens) <= 0:
+        raise ValueError("models.task_max_tokens must be positive.")
     mode = evaluation_mode
     if mode not in {"legacy", "layered", "layered_auto"}:
         raise ValueError("evaluation.mode must be legacy, layered, or layered_auto.")
@@ -138,6 +155,12 @@ def load_task_config(path: Path) -> TaskConfig:
         int(evaluation.get("stop_after_no_improvement", 2)),
         float(evaluation.get("minimum_improvement", 0.01)),
         bool(evaluation.get("retain_risk_memory", True)),
+        (
+            int(evaluation["first_round_hard_failure_stop_count"])
+            if evaluation.get("first_round_hard_failure_stop_count") is not None
+            else None
+        ),
+        int(evaluation.get("judge_workers", 1)),
     )
     counts = (
         evaluation_config.max_candidates,
@@ -148,6 +171,7 @@ def load_task_config(path: Path) -> TaskConfig:
         evaluation_config.judge_model_max_calls,
         evaluation_config.max_rounds,
         evaluation_config.stop_after_no_improvement,
+        evaluation_config.judge_workers,
     )
     if (
         any(value < 0 for value in counts)
@@ -155,6 +179,11 @@ def load_task_config(path: Path) -> TaskConfig:
         or evaluation_config.minimum_improvement < 0
         or evaluation_config.max_rounds <= 0
         or evaluation_config.stop_after_no_improvement <= 0
+        or evaluation_config.judge_workers <= 0
+        or (
+            evaluation_config.first_round_hard_failure_stop_count is not None
+            and evaluation_config.first_round_hard_failure_stop_count < 0
+        )
     ):
         raise ValueError(
             "Layered evaluation counts and minimum_improvement must be non-negative, "
@@ -166,7 +195,14 @@ def load_task_config(path: Path) -> TaskConfig:
         dataset=DatasetConfig(_resolve(root, dataset["path"]), input_fields, dataset.get("expected_field"),
                               _resolve(root, dataset.get("annotations"))),
         signal_spec=_resolve(root, raw["signals"]["path"]),
-        models=ModelConfig(models.get("task_model"), models.get("judge_model"), models.get("generator_model"), models.get("base_url")),
+        models=ModelConfig(
+            models.get("task_model"),
+            models.get("judge_model"),
+            models.get("generator_model"),
+            models.get("base_url"),
+            task_response_format,
+            int(task_max_tokens) if task_max_tokens is not None else None,
+        ),
         optimization=OptimizationConfig(str(optimization.get("initial_prompt", "")), initial_prompt_path,
                                         int(optimization.get("rounds", 3)),
                                         int(optimization.get("max_calls", 100)), float(optimization.get("max_cost_usd", 10.0)),

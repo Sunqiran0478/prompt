@@ -50,8 +50,25 @@ def as_signals(value: dict[str, Any]) -> SignalSpec:
         [SoftSignal(**item) for item in value["soft_signals"]], value.get("status", "draft"), value.get("created_by", "unknown"))
 
 
+def _task_response_options(args: argparse.Namespace) -> tuple[str | None, int | None]:
+    response_format = getattr(args, "response_format", None)
+    if response_format is None and getattr(args, "plugin", None) == "finance_classification":
+        response_format = "json_object"
+    max_tokens = getattr(args, "max_tokens", None)
+    if max_tokens is None and response_format == "json_object":
+        max_tokens = 2048
+    return response_format, max_tokens
+
+
+def _structured_max_tokens(model: str, default: int = 2048) -> int:
+    return 8192 if "reasoner" in model.lower() else default
+
+
 def draft_signals(args: argparse.Namespace) -> int:
-    model = OpenAICompatibleModel(args.model) if args.model else None
+    model = (
+        OpenAICompatibleModel(args.model, response_format="json_object", max_tokens=2048)
+        if args.model else None
+    )
     spec = LLMSignalCompiler(model).compile(args.acceptance, args.id, args.version)
     _json(Path(args.output), asdict(spec))
     print(f"Draft SignalSpec saved to {args.output}. Review and run approve-signals before optimization.")
@@ -114,7 +131,11 @@ def annotate_silver(args: argparse.Namespace) -> int:
     if signals.status != "approved":
         raise ValueError("Approve the SignalSpec before generating silver labels.")
     samples = load_samples(Path(args.dataset), args.inputs.split(","), args.expected_field)
-    model = OpenAICompatibleModel(args.model)
+    model = OpenAICompatibleModel(
+        args.model,
+        response_format="json_object",
+        max_tokens=_structured_max_tokens(args.model),
+    )
     annotator = LLMSilverAnnotator(model)
     targets = [item for item in samples if item.expected is None][:args.limit]
     annotations, errors = [], []
@@ -149,9 +170,25 @@ def optimize(args: argparse.Namespace) -> int:
     budget = Budget(args.max_calls, args.max_cost, args.max_seconds)
     if args.model:
         base_url = getattr(args, "base_url", None)
-        task_model = OpenAICompatibleModel(args.model, base_url=base_url)
-        judge_model = OpenAICompatibleModel(args.judge_model or args.model, base_url=base_url)
-        generator = LLMPromptGenerator(OpenAICompatibleModel(args.generator_model or args.model, base_url=base_url, temperature=0.7))
+        task_model = OpenAICompatibleModel(
+            args.model,
+            base_url=base_url,
+            response_format=getattr(args, "response_format", None),
+            max_tokens=getattr(args, "max_tokens", None),
+        )
+        judge_model = OpenAICompatibleModel(
+            args.judge_model or args.model,
+            base_url=base_url,
+            response_format="json_object",
+            max_tokens=_structured_max_tokens(args.judge_model or args.model),
+        )
+        generator = LLMPromptGenerator(OpenAICompatibleModel(
+            args.generator_model or args.model,
+            base_url=base_url,
+            temperature=0.7,
+            response_format="json_object",
+            max_tokens=8192,
+        ))
         evaluator = SignalEvaluator(LLMJudge(judge_model))
     else:
         task_model, evaluator, generator = RuleBasedDemoModel(), SignalEvaluator(ReferenceJudge()), TemplatePromptGenerator()
@@ -196,10 +233,27 @@ def optimize_layered(args: argparse.Namespace) -> int:
     if not args.model:
         raise ValueError("Layered optimization requires an explicit task model.")
     base_url = getattr(args, "base_url", None)
-    task_model = OpenAICompatibleModel(args.model, base_url=base_url)
-    judge = LLMJudge(OpenAICompatibleModel(args.judge_model or args.model, base_url=base_url))
+    response_format, task_max_tokens = _task_response_options(args)
+    task_model = OpenAICompatibleModel(
+        args.model,
+        base_url=base_url,
+        response_format=response_format,
+        max_tokens=task_max_tokens,
+    )
+    judge = LLMJudge(OpenAICompatibleModel(
+        args.judge_model or args.model,
+        base_url=base_url,
+        response_format="json_object",
+        max_tokens=_structured_max_tokens(args.judge_model or args.model),
+    ))
     generator = LLMPromptGenerator(
-        OpenAICompatibleModel(args.generator_model or args.model, base_url=base_url, temperature=0.7)
+        OpenAICompatibleModel(
+            args.generator_model or args.model,
+            base_url=base_url,
+            temperature=0.7,
+            response_format="json_object",
+            max_tokens=8192,
+        )
     )
     fixed_sample_kinds = tuple(
         kind.strip()
@@ -215,6 +269,7 @@ def optimize_layered(args: argparse.Namespace) -> int:
         task_model_max_calls=args.task_model_max_calls,
         judge_model_max_calls=args.judge_model_max_calls,
         max_seconds=args.max_seconds,
+        judge_workers=args.judge_workers,
     )
     result = LayeredPromptOptimizer(task_model, judge, generator, validator, policy).optimize(
         prompt,
@@ -272,15 +327,28 @@ def optimize_auto(args: argparse.Namespace) -> int:
     if not args.model:
         raise ValueError("Auto optimization requires an explicit task model.")
     base_url = getattr(args, "base_url", None)
-    task_model = OpenAICompatibleModel(args.model, base_url=base_url)
+    response_format, task_max_tokens = _task_response_options(args)
+    task_model = OpenAICompatibleModel(
+        args.model,
+        base_url=base_url,
+        response_format=response_format,
+        max_tokens=task_max_tokens,
+    )
     judge = LLMJudge(
-        OpenAICompatibleModel(args.judge_model or args.model, base_url=base_url)
+        OpenAICompatibleModel(
+            args.judge_model or args.model,
+            base_url=base_url,
+            response_format="json_object",
+            max_tokens=_structured_max_tokens(args.judge_model or args.model),
+        )
     )
     generator = LLMPromptGenerator(
         OpenAICompatibleModel(
             args.generator_model or args.model,
             base_url=base_url,
             temperature=0.7,
+            response_format="json_object",
+            max_tokens=8192,
         )
     )
     fixed_sample_kinds = tuple(
@@ -297,12 +365,16 @@ def optimize_auto(args: argparse.Namespace) -> int:
         task_model_max_calls=args.task_model_max_calls,
         judge_model_max_calls=args.judge_model_max_calls,
         max_seconds=args.max_seconds,
+        judge_workers=args.judge_workers,
     )
     auto_policy = AutoOptimizationPolicy(
         max_rounds=args.max_rounds,
         stop_after_no_improvement=args.stop_after_no_improvement,
         minimum_improvement=args.minimum_improvement,
         retain_risk_memory=args.retain_risk_memory,
+        first_round_hard_failure_stop_count=(
+            args.first_round_hard_failure_stop_count
+        ),
     )
     result = AutoPromptOptimizer(
         task_model,
@@ -347,6 +419,8 @@ def run_config(args: argparse.Namespace) -> int:
             "output_schema": config.output_schema, "model": config.models.task_model,
             "judge_model": config.models.judge_model, "generator_model": config.models.generator_model,
             "base_url": config.models.base_url, "plugin": config.plugin.name,
+            "response_format": config.models.task_response_format,
+            "max_tokens": config.models.task_max_tokens,
             "taxonomy": str(config.plugin.taxonomy_path) if config.plugin.taxonomy_path else None,
             "max_candidates": config.evaluation.max_candidates,
             "fixed_sample_kinds": ",".join(config.evaluation.fixed_sample_kinds),
@@ -360,6 +434,10 @@ def run_config(args: argparse.Namespace) -> int:
             "stop_after_no_improvement": config.evaluation.stop_after_no_improvement,
             "minimum_improvement": config.evaluation.minimum_improvement,
             "retain_risk_memory": config.evaluation.retain_risk_memory,
+            "first_round_hard_failure_stop_count": (
+                config.evaluation.first_round_hard_failure_stop_count
+            ),
+            "judge_workers": config.evaluation.judge_workers,
             "resume_run": getattr(args, "resume_run", None),
             "config_snapshot": json.loads(config.path.read_text(encoding="utf-8")),
         }
@@ -386,6 +464,8 @@ def run_config(args: argparse.Namespace) -> int:
         "output_description": config.output_description, "output_schema": config.output_schema,
         "model": config.models.task_model, "judge_model": config.models.judge_model,
         "generator_model": config.models.generator_model, "base_url": config.models.base_url,
+        "response_format": config.models.task_response_format,
+        "max_tokens": config.models.task_max_tokens,
         "rounds": config.optimization.rounds, "max_calls": config.optimization.max_calls,
         "max_cost": config.optimization.max_cost_usd, "max_seconds": config.optimization.max_seconds,
         "runs": str(config.runs_dir), "config_snapshot": json.loads(config.path.read_text(encoding="utf-8")),
@@ -402,6 +482,8 @@ def validate_config(args: argparse.Namespace) -> int:
                       "runs_dir": str(config.runs_dir), "model": config.models.task_model,
                       "evaluation_mode": config.evaluation.mode, "plugin": config.plugin.name,
                       "taxonomy": str(config.plugin.taxonomy_path) if config.plugin.taxonomy_path else None,
+                      "task_response_format": config.models.task_response_format,
+                      "task_max_tokens": config.models.task_max_tokens,
                       "credentials": "environment-only"}, ensure_ascii=False, indent=2))
     return 0
 
@@ -426,8 +508,17 @@ def final_evaluate(args: argparse.Namespace) -> int:
     task = TaskSpec(args.task, args.inputs.split(","), args.output_description)
     budget = Budget(args.max_calls, args.max_cost, args.max_seconds)
     if args.model:
-        model = OpenAICompatibleModel(args.model)
-        evaluator = SignalEvaluator(LLMJudge(OpenAICompatibleModel(args.judge_model or args.model)))
+        response_format, max_tokens = _task_response_options(args)
+        model = OpenAICompatibleModel(
+            args.model,
+            response_format=response_format,
+            max_tokens=max_tokens,
+        )
+        evaluator = SignalEvaluator(LLMJudge(OpenAICompatibleModel(
+            args.judge_model or args.model,
+            response_format="json_object",
+            max_tokens=_structured_max_tokens(args.judge_model or args.model),
+        )))
     else:
         model, evaluator = RuleBasedDemoModel(), SignalEvaluator(ReferenceJudge())
     evaluation = PromptOptimizer(model, evaluator, TemplatePromptGenerator()).evaluate(args.prompt, samples, signals, budget)
@@ -463,7 +554,7 @@ def main() -> int:
     config_run = sub.add_parser("run-config", help="Run an optimization experiment from a versioned task.json")
     config_run.add_argument("--config", required=True); config_run.add_argument("--prompt", help="Optional one-run prompt override"); config_run.add_argument("--model", help="Optional one-run task model override"); config_run.add_argument("--resume-run", help="Resume a layered run ID"); config_run.set_defaults(func=run_config)
     run = sub.add_parser("optimize", help="Legacy mode: judge every sample in a budget-bounded experiment")
-    run.add_argument("--dataset", required=True); run.add_argument("--inputs", required=True); run.add_argument("--expected-field"); run.add_argument("--annotations", help="JSONL annotations; gold_human requires reviewer, silver_auto requires judge_run_id"); run.add_argument("--signals", required=True); run.add_argument("--prompt", required=True); run.add_argument("--task", default="generic"); run.add_argument("--output-description", default="Return the requested task result."); run.add_argument("--model", help="OpenAI-compatible task model; omit for local demo"); run.add_argument("--judge-model"); run.add_argument("--generator-model"); run.add_argument("--base-url", help="OpenAI-compatible endpoint; credentials remain in environment"); run.add_argument("--rounds", type=int, default=3); run.add_argument("--max-calls", type=int, default=100); run.add_argument("--max-cost", type=float, default=10.0); run.add_argument("--max-seconds", type=float, default=900.0); run.add_argument("--runs", default="runs"); run.set_defaults(func=optimize)
+    run.add_argument("--dataset", required=True); run.add_argument("--inputs", required=True); run.add_argument("--expected-field"); run.add_argument("--annotations", help="JSONL annotations; gold_human requires reviewer, silver_auto requires judge_run_id"); run.add_argument("--signals", required=True); run.add_argument("--prompt", required=True); run.add_argument("--task", default="generic"); run.add_argument("--output-description", default="Return the requested task result."); run.add_argument("--model", help="OpenAI-compatible task model; omit for local demo"); run.add_argument("--judge-model"); run.add_argument("--generator-model"); run.add_argument("--base-url", help="OpenAI-compatible endpoint; credentials remain in environment"); run.add_argument("--response-format", choices=["text", "json_object"]); run.add_argument("--max-tokens", type=int); run.add_argument("--rounds", type=int, default=3); run.add_argument("--max-calls", type=int, default=100); run.add_argument("--max-cost", type=float, default=10.0); run.add_argument("--max-seconds", type=float, default=900.0); run.add_argument("--runs", default="runs"); run.set_defaults(func=optimize)
     layered = sub.add_parser("optimize-layered", help="Cost-aware fixed-plus-dynamic risk funnel")
     layered.add_argument("--dataset", required=True); layered.add_argument("--inputs", required=True)
     layered.add_argument("--expected-field"); layered.add_argument("--annotations")
@@ -473,6 +564,8 @@ def main() -> int:
     layered.add_argument("--output-description", default="Return the requested task result.")
     layered.add_argument("--model", required=True); layered.add_argument("--judge-model")
     layered.add_argument("--generator-model"); layered.add_argument("--base-url")
+    layered.add_argument("--response-format", choices=["text", "json_object"])
+    layered.add_argument("--max-tokens", type=int)
     layered.add_argument("--plugin", choices=["finance_classification"]); layered.add_argument("--taxonomy")
     layered.add_argument("--max-candidates", type=int, default=2)
     layered.add_argument("--fixed-sample-kinds", default="boundary_probe")
@@ -481,6 +574,7 @@ def main() -> int:
     layered.add_argument("--human-review-top-k", type=int, default=20)
     layered.add_argument("--task-model-max-calls", type=int, default=2000)
     layered.add_argument("--judge-model-max-calls", type=int, default=240)
+    layered.add_argument("--judge-workers", type=int, default=1)
     layered.add_argument("--max-seconds", type=float, default=7200.0)
     layered.add_argument("--runs", default="runs"); layered.add_argument("--resume-run")
     layered.set_defaults(func=optimize_layered)
@@ -493,6 +587,8 @@ def main() -> int:
     auto.add_argument("--output-description", default="Return the requested task result.")
     auto.add_argument("--model", required=True); auto.add_argument("--judge-model")
     auto.add_argument("--generator-model"); auto.add_argument("--base-url")
+    auto.add_argument("--response-format", choices=["text", "json_object"])
+    auto.add_argument("--max-tokens", type=int)
     auto.add_argument("--plugin", choices=["finance_classification"]); auto.add_argument("--taxonomy")
     auto.add_argument("--max-candidates", type=int, default=2)
     auto.add_argument("--fixed-sample-kinds", default="boundary_probe")
@@ -510,10 +606,12 @@ def main() -> int:
         action=argparse.BooleanOptionalAction,
         default=True,
     )
+    auto.add_argument("--first-round-hard-failure-stop-count", type=int)
+    auto.add_argument("--judge-workers", type=int, default=1)
     auto.add_argument("--runs", default="runs"); auto.add_argument("--resume-run")
     auto.set_defaults(func=optimize_auto)
     final = sub.add_parser("final-evaluate", help="Evaluate a frozen final_test set exactly once")
-    final.add_argument("--dataset", required=True); final.add_argument("--split-manifest", required=True); final.add_argument("--inputs", required=True); final.add_argument("--expected-field"); final.add_argument("--signals", required=True); final.add_argument("--prompt", required=True); final.add_argument("--task", default="generic"); final.add_argument("--output-description", default="Return the requested task result."); final.add_argument("--model"); final.add_argument("--judge-model"); final.add_argument("--max-calls", type=int, default=100); final.add_argument("--max-cost", type=float, default=10.0); final.add_argument("--max-seconds", type=float, default=900.0); final.add_argument("--runs", default="runs"); final.set_defaults(func=final_evaluate)
+    final.add_argument("--dataset", required=True); final.add_argument("--split-manifest", required=True); final.add_argument("--inputs", required=True); final.add_argument("--expected-field"); final.add_argument("--signals", required=True); final.add_argument("--prompt", required=True); final.add_argument("--task", default="generic"); final.add_argument("--output-description", default="Return the requested task result."); final.add_argument("--model"); final.add_argument("--judge-model"); final.add_argument("--response-format", choices=["text", "json_object"]); final.add_argument("--max-tokens", type=int); final.add_argument("--max-calls", type=int, default=100); final.add_argument("--max-cost", type=float, default=10.0); final.add_argument("--max-seconds", type=float, default=900.0); final.add_argument("--runs", default="runs"); final.set_defaults(func=final_evaluate)
     args = parser.parse_args()
     return args.func(args)
 

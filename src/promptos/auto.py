@@ -8,6 +8,8 @@ import time
 import uuid
 from collections import Counter
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -21,6 +23,12 @@ from .layered import (
     _json_line_records,
     _prompt_key,
 )
+from .reporting import render_auto_report
+
+try:
+    _SOFTWARE_VERSION = version("promptos")
+except PackageNotFoundError:
+    _SOFTWARE_VERSION = "development"
 
 
 @dataclass(frozen=True)
@@ -29,6 +37,7 @@ class AutoOptimizationPolicy:
     stop_after_no_improvement: int = 2
     minimum_improvement: float = 0.01
     retain_risk_memory: bool = True
+    first_round_hard_failure_stop_count: int | None = None
 
     def validate(self) -> None:
         if self.max_rounds <= 0:
@@ -37,6 +46,11 @@ class AutoOptimizationPolicy:
             raise ValueError("stop_after_no_improvement must be positive.")
         if self.minimum_improvement < 0:
             raise ValueError("minimum_improvement cannot be negative.")
+        if (
+            self.first_round_hard_failure_stop_count is not None
+            and self.first_round_hard_failure_stop_count < 0
+        ):
+            raise ValueError("first_round_hard_failure_stop_count cannot be negative.")
 
 
 @dataclass(frozen=True)
@@ -195,15 +209,43 @@ class AutoPromptOptimizer:
         judge_calls = 0
         generator_calls = 0
         task_cost = 0.0
+        judge_cost = 0.0
+        generator_cost = 0.0
         for round_dir in sorted(run_dir.glob("round_*")):
             task_rows = _json_line_records(round_dir / "task_outputs.jsonl")
             stability_rows = _json_line_records(round_dir / "stability_outputs.jsonl")
             judge_rows = _json_line_records(round_dir / "judge_results.jsonl")
             task_calls += len(task_rows) + len(stability_rows)
-            judge_calls += len(judge_rows)
-            task_cost += sum(float(row.get("cost_usd", 0.0)) for row in task_rows)
+            shared_calls = {
+                str(row["shared_call_id"]) for row in judge_rows if row.get("shared_call_id")
+            }
+            judge_calls += len(shared_calls) + sum(
+                not row.get("shared_call_id") for row in judge_rows
+            )
+            task_cost += sum(
+                float(row.get("cost_usd", 0.0))
+                for row in task_rows + stability_rows
+            )
+            seen_shared: set[str] = set()
+            for row in judge_rows:
+                shared_id = str(row.get("shared_call_id", ""))
+                if shared_id and shared_id in seen_shared:
+                    continue
+                if shared_id:
+                    seen_shared.add(shared_id)
+                judge_cost += float(
+                    row.get("judgment", {}).get("raw", {}).get(
+                        "_promptos_judge_cost_usd", 0.0
+                    )
+                )
             if (round_dir / "prompts.json").exists():
                 generator_calls += 1
+                metadata = (
+                    json.loads((round_dir / "generator_metadata.json").read_text(encoding="utf-8"))
+                    if (round_dir / "generator_metadata.json").exists()
+                    else {}
+                )
+                generator_cost += float(metadata.get("cost_usd") or 0.0)
         return LayeredBudget(
             self.layered_policy.task_model_max_calls,
             self.layered_policy.judge_model_max_calls,
@@ -212,6 +254,8 @@ class AutoPromptOptimizer:
             judge_calls=judge_calls,
             generator_calls=generator_calls,
             task_cost_usd=task_cost,
+            judge_cost_usd=judge_cost,
+            generator_cost_usd=generator_cost,
             started_at=time.monotonic(),
         )
 
@@ -236,6 +280,7 @@ class AutoPromptOptimizer:
             "initial_prompt": initial_prompt,
             "signal_spec": {"id": signals.id, "version": signals.version},
             "sample_hash": _sample_hash(frozen),
+            "software_version": _SOFTWARE_VERSION,
             "layered_policy": asdict(self.layered_policy),
             "auto_policy": asdict(self.auto_policy),
         }
@@ -249,6 +294,15 @@ class AutoPromptOptimizer:
         final_path = run_dir / "run.json"
         if final_path.exists():
             final = json.loads(final_path.read_text(encoding="utf-8"))
+            # Existing pre-report runs are intentionally not retrofitted. Runs created
+            # with report support already have a manifest and may be regenerated safely.
+            if (run_dir / "report_manifest.json").exists():
+                render_auto_report(
+                    run_dir,
+                    frozen,
+                    completed=True,
+                    stop_reason=final.get("stop_reason"),
+                )
             return AutoOptimizationResult(
                 identifier,
                 run_dir,
@@ -270,6 +324,7 @@ class AutoPromptOptimizer:
                 "risk_memory_case_ids": [],
                 "round_history": [],
                 "next_feedback": "",
+                "started_at": datetime.now(timezone.utc).isoformat(),
             }
             _write_json(state_path, state)
         budget = self._rehydrate_budget(run_dir)
@@ -297,6 +352,8 @@ class AutoPromptOptimizer:
                 risk_memory_case_ids=state["risk_memory_case_ids"],
                 export_human_review=False,
                 shared_budget=budget,
+                comparative_judge=round_index >= 1,
+                identical_calibration_k=10,
             )
             final_round_dir = result.run_dir
             summary = _failure_summary(result.run_dir)
@@ -330,14 +387,21 @@ class AutoPromptOptimizer:
             )
             state["round_history"].append(decision)
             _write_json(state_path, state)
+            render_auto_report(
+                run_dir,
+                frozen,
+                completed=False,
+            )
+            if (
+                round_index == 0
+                and self.auto_policy.first_round_hard_failure_stop_count is not None
+                and int(result.comparison[0]["hard_failure_count"])
+                == self.auto_policy.first_round_hard_failure_stop_count
+            ):
+                stop_reason = "first_round_hard_failure_count_matched_stop_condition"
+                break
             if int(state["no_improvement_rounds"]) >= self.auto_policy.stop_after_no_improvement:
                 stop_reason = "no_material_improvement"
-                break
-            if (
-                result.comparison[0]["hard_failure_count"] == 0
-                and not accepted
-            ):
-                stop_reason = "hard_failures_zero_and_no_improvement"
                 break
         if final_round_dir is None:
             raise RuntimeError("Auto optimization completed no rounds.")
@@ -383,10 +447,18 @@ class AutoPromptOptimizer:
             "layered_policy": asdict(self.layered_policy),
             "auto_policy": asdict(self.auto_policy),
             "budget": asdict(budget),
+            "started_at": state.get("started_at"),
+            "completed_at": datetime.now(timezone.utc).isoformat(),
         }
         if task_config is not None:
             manifest["task_config"] = task_config
         _write_json(final_path, manifest)
+        render_auto_report(
+            run_dir,
+            frozen,
+            completed=True,
+            stop_reason=stop_reason,
+        )
         return AutoOptimizationResult(
             identifier,
             run_dir,
